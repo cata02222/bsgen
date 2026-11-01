@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 import gradio as gr
 from PIL import Image
 
@@ -365,7 +367,7 @@ def diff_choices(by_name, version):
     return list(DIFFS)
 
 
-def prefetch(device, link=None):
+def prefetch(device):
     from bsgen import songstars
 
     def models():
@@ -383,8 +385,7 @@ def prefetch(device, link=None):
             job()
         except Exception as e:
             print(f"prefetch: {e}", flush=True)
-    if link:
-        print(f"\nready: {link}\n", flush=True)
+    print("models ready", flush=True)
 
 
 def show_link(local, public):
@@ -735,12 +736,17 @@ def main():
                            font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"])
     demo = build(args.ckpt, args.device)
     share = args.share or "COLAB_RELEASE_TAG" in os.environ
-    _, local, public = demo.queue(default_concurrency_limit=1).launch(
-        server_name=args.host, server_port=args.port, share=share, theme=theme, css=CSS, js=DARK,
-        allowed_paths=[str(OUT)], quiet=True, prevent_thread_lock=True)
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        _, local, public = demo.queue(default_concurrency_limit=1).launch(
+            server_name=args.host, server_port=args.port, share=share, theme=theme, css=CSS, js=DARK,
+            allowed_paths=[str(OUT)], quiet=True, prevent_thread_lock=True)
+    if share and not public:
+        print(said.getvalue(), end="", flush=True)
     show_link(local, public)
     if not args.ckpt:
-        threading.Thread(target=prefetch, args=(args.device, public or local), daemon=True).start()
+        print("loading the models in the background...", flush=True)
+        threading.Thread(target=prefetch, args=(args.device,), daemon=True).start()
     demo.block_thread()
 
 
