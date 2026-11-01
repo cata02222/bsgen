@@ -23,6 +23,7 @@ MAX_MAPPERS = 128
 NJS_RANGE = (6, 30)
 RATING_STEP, N_RATINGS = 0.5, 33
 COND_FIELDS = ("stars", "style", "mapper", "njs", "nps", "objects", "pass", "acc", "tech")
+WNPS_STEP, N_WNPS = 0.5, 49
 OBJ_WALLS, OBJ_BOMBS, OBJ_ARCS = 1, 2, 4
 
 
@@ -64,7 +65,9 @@ class Vocab:
             self.cond0[f] = k
             k += sizes[f] + 1
         self.cond_size = sizes
-        self.size = k
+        self.controls_end = k
+        self.wnps0 = k
+        self.size = k + N_WNPS + 1
 
     def star(self, stars):
         if stars is None:
@@ -87,15 +90,22 @@ class Vocab:
             j = int(value)
         return self.cond0[field] + j
 
+    def wnps(self, value):
+        if value is None:
+            return self.wnps0 + N_WNPS
+        return self.wnps0 + int(np.clip(round(value / WNPS_STEP), 0, N_WNPS - 1))
+
     def prefix(self, cond):
         if not isinstance(cond, dict):
             return [self.BOS, self.star(cond)]
-        return [self.BOS] + [self.cond(f, cond.get(f)) for f in COND_FIELDS]
+        out = [self.BOS] + [self.cond(f, cond.get(f)) for f in COND_FIELDS]
+        return out + [self.wnps(cond["wnps"])] if "wnps" in cond else out
 
     def none_like(self, cond, keep=("objects",)):
         if not isinstance(cond, dict):
             return None
-        return {f: cond.get(f) if f in keep else None for f in COND_FIELDS}
+        out = {f: cond.get(f) if f in keep else None for f in COND_FIELDS}
+        return out | {"wnps": None} if "wnps" in cond else out
 
     def swing(self, hand, forehand, air):
         return self.swing0 + hand * 4 + forehand * 2 + air

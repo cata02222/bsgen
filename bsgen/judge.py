@@ -233,6 +233,16 @@ def note_heights(height):
     return np.array([0.85, 1.4, 1.9]) + min(max((height - 1.8) * 0.5, -0.2), 0.6)
 
 
+def _dot_angles(blade, vel, f):
+    way = vel[max(f - 2, 0):f + 3, :2].mean(0)
+    way = np.array([*way, 0.0]) / (np.linalg.norm(way) + 1e-9)
+    b = blade[max(f - RATE_BEFORE, 0):f + RATE_AFTER]
+    p0, p1 = b[:, 2], b @ way
+    ang = np.sign(p1) * np.degrees(np.arccos(np.clip(p0 / np.maximum(np.hypot(p0, p1), 1e-8), -1, 1)))
+    cut = min(f, RATE_BEFORE)
+    return ang[:cut], ang[cut:]
+
+
 def note_events(notes, motion, height):
     good, bad, bad_saber, band = replay_hits(notes, motion)
     hilt, blade = tips(motion.astype(np.float64))
@@ -252,6 +262,8 @@ def note_events(notes, motion, height):
             continue
         j = f - int(round(sec * FPS)) - BAND[0]
         pre, post = band[k, max(j - RATE_BEFORE, 0):max(j, 0)], band[k, max(j, 0):j + RATE_AFTER]
+        if d == DOT:
+            pre, post = _dot_angles(blade[:, c], vel[:, c], f)
         before = np.clip(np.nanmin(pre) / -100, 0, 1) if np.isfinite(pre).any() else 0.0
         after = np.clip(np.nanmax(post) / 60, 0, 1) if np.isfinite(post).any() else 0.0
         h = hilt[f, saber]

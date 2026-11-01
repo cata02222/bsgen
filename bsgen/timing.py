@@ -58,7 +58,8 @@ def _score(act, period, lo, hi, bins=None):
     prof = np.bincount(k, act[lo:hi], bins) / np.maximum(np.bincount(k, None, bins), 1)
     r = max(1, int(round(bins / period)))
     prof = np.convolve(np.concatenate([prof[-r:], prof, prof[:r]]), np.ones(2 * r + 1) / (2 * r + 1), "valid")
-    off = np.max([np.roll(prof, -int(round(f * bins))) for f in SUBDIVISIONS], 0)
+    shift = np.array([int(round(f * bins)) for f in SUBDIVISIONS])
+    off = prof[(np.arange(len(prof))[None] + shift[:, None]) % len(prof)].max(0)
     val = prof - off
     j = int(np.argmax(val))
     return float(val[j]), (j + 0.5) / bins * period
@@ -94,8 +95,14 @@ def _refine(act, period, phase, lo, hi):
 
 def fit_grid(act, fps, span=None, seg_sec=40.0, steps=401):
     lo, hi = span or (0, len(act))
-    seg = int(seg_sec * fps)
-    mid = (lo + hi) // 2
+    fits = [_fit_from(act, fps, lo, hi, lo + (hi - lo) * f, int(seg_sec * fps), steps) for f in (0.5, 0.25, 0.75)]
+    score = [_score(act, period, lo, hi)[0] for period, _, _ in fits]
+    period, phase, s = fits[int(np.argmax(score))]
+    return 60 * fps / period, phase / fps, s
+
+
+def _fit_from(act, fps, lo, hi, centre, seg, steps):
+    mid = int(centre)
     slo, shi = max(lo, mid - seg // 2), min(hi, mid + seg // 2)
     min_p, max_p = 60 * fps / BPM_RANGE[1], 60 * fps / BPM_RANGE[0]
     x = act[slo:shi] - act[slo:shi].mean()
@@ -117,8 +124,7 @@ def fit_grid(act, fps, span=None, seg_sec=40.0, steps=401):
         w = b - a
         a, b = max(lo, a - w // 2), min(hi, b + w // 2)
         period, phase = _refine(act, period, phase, a, b)
-    phase = phase % period
-    return 60 * fps / period, phase / fps, s
+    return period, phase % period, s
 
 
 OCTAVES = (0.5, 1.0, 2.0)
@@ -154,8 +160,7 @@ def beat_grid(bpm, first_sec, duration):
     return beat_times, (first_sec / spb) % 1.0
 
 
-@torch.no_grad()
-def octave_class(trees, x):
+def forest_raw(trees, x):
     raw = trees["baseline"].astype(np.float64).copy()
     for k, i in enumerate(trees["roots"]):
         while not trees["leaf"][i]:
@@ -163,7 +168,21 @@ def octave_class(trees, x):
             left = trees["missing_left"][i] if np.isnan(v) else v <= trees["threshold"][i]
             i = trees["left"][i] if left else trees["right"][i]
         raw[trees["cls"][k]] += trees["value"][i]
-    return int(trees["classes"][np.argmax(raw)])
+    return raw
+
+
+def forests(path):
+    out = {}
+    with np.load(path) as z:
+        for key in z.files:
+            name, _, field = key.rpartition("/")
+            out.setdefault(name, {})[field] = z[key]
+    return out
+
+
+@torch.no_grad()
+def octave_class(trees, x):
+    return int(trees["classes"][np.argmax(forest_raw(trees, x))])
 
 
 def _shift(act, period, phase, lo, hi):
@@ -311,11 +330,13 @@ def _fit(act, fps, span, trees):
     return cands[octave_class(trees, feats)]
 
 
-def sections(act, fps, trees):
+def sections(act, fps, trees, whole=None):
     spans, reps, score = _window_scores(act, fps)
     path = _path(score)
     cuts = [i for i in range(1, len(path)) if path[i] != path[i - 1]]
     if not cuts:
+        if whole is not None:
+            whole.append(True)
         return [(0.0, *_fit(act, fps, (0, len(act)), trees))]
     zones = [(spans[i][0], spans[i - 1][1]) for i in cuts]
     cores = [(a[1] if a else 0, b[0] if b else len(act)) for a, b in zip([None] + zones, zones + [None])]
@@ -348,13 +369,29 @@ def tempo_map(secs):
 
 
 def detect_tempo(logmel, fps, root, dev="cuda"):
+    import hashlib, json
+    model = Path(root) / "timing.safetensors"
+    key = hashlib.sha1(np.ascontiguousarray(logmel).tobytes() + f"{fps}|{model.stat().st_size}|{model.stat().st_mtime_ns}"
+                       .encode()).hexdigest()
+    cache = Path(root) / "tempo_cache" / f"{key}.json"
+    try:
+        secs = [tuple(x) for x in json.loads(cache.read_text())]
+        return (*tempo_map(secs), secs)
+    except (OSError, ValueError):
+        pass
     act = _activation(logmel, root, dev)
     trees = dict(np.load(Path(root) / "octave.npz"))
-    secs = sections(act, fps, trees)
-    if len(secs) == 1:
+    whole = []
+    secs = sections(act, fps, trees, whole)
+    if len(secs) == 1 and not whole:
         bpm, first, _ = fit_grid(act, fps)
         feats, cands = octave_features(act, fps, bpm, first)
         bpm, first = cands[octave_class(trees, feats)]
         secs = [(0.0, float(bpm), float(first))]
+    try:
+        cache.parent.mkdir(exist_ok=True)
+        cache.write_text(json.dumps([[float(v) for v in x] for x in secs]))
+    except OSError:
+        pass
     tm, offset = tempo_map(secs)
     return tm, offset, secs

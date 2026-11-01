@@ -2,7 +2,7 @@
 
 <p align="center">Beat Saber maps from any song, and a model that plays them.</p>
 
-<p align="center"><a href="https://colab.research.google.com/github/cata02222/bsgen/blob/main/colab.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a></p>
+<p align="center"><a href="https://colab.research.google.com/github/cata02222/bsgen/blob/main/colab.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a> <a href="https://discord.gg/DCFdQYAQV4"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a></p>
 
 <p align="center">
 <img src="assets/clip-a.webp" width="49%"> <img src="assets/clip-b.webp" width="49%">
@@ -39,10 +39,23 @@ python scripts/play.py --map "out/song 10star.zip" --diff ExpertPlus
 ## Models
 
 The [bsgen-1.0](https://huggingface.co/cata121/bsgen-1.0) models:
-- map model: 65M parameters, ~40 min on one H100, then a 50 min fine-tune on an RTX 3060
-- player model: 38M parameters, ~20 min on one H100
+- rhythm model: 47M parameters, picks when the notes come
+- map model: 65M parameters, ~70 min on one H100, fills them in
+- lighting model: 7M parameters, the lightshow
+- player model: 38M parameters, ~1 hour on one H100
+
+The 1.0 and 1.1 map models are still in the menu under Expert.
 
 ## Changelog
+
+**1.2**
+- new map model, trained from scratch on more songs
+- a rhythm model picks the hits first
+- stars closer to what you asked for
+- lighting model, and a scene picker
+- covers and artist names found online
+- less repeating, no notes that make the sabers meet head on
+- faster on Linux
 
 **1.1**
 - new map model, better at low and mid stars

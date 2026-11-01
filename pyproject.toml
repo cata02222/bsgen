@@ -1,6 +1,6 @@
 [project]
 name = "bsgen"
-version = "1.1.0"
+version = "1.2.0"
 description = "Beat Saber maps from any song"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -10,6 +10,7 @@ dependencies = [
     "huggingface-hub>=0.25",
     "librosa>=0.10",
     "numpy>=1.26",
+    "pillow>=10.0",
     "safetensors>=0.4",
     "scipy>=1.10",
     "soundfile>=0.12",
@@ -21,4 +22,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["bsgen"]
+packages = ["bsgen", "bsgen.legacy"]
+
+[tool.setuptools.package-data]
+bsgen = ["assets/*.png", "_rules.abi3.so"]

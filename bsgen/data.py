@@ -24,6 +24,16 @@ CACHE_VERSION = "4"
 EVENT_VERSION = "5"
 LABELLED = "labelled"
 AUDIO_VERSION = "1"
+MEM_BEATS = 32
+MEM_FRAMES = MEM_BEATS * FRAMES_PER_BEAT
+MEM_SLOTS = MEM_FRAMES // 2
+MEM_TICKS = MEM_BEATS * TICKS // MEM_SLOTS
+SIM_PER_BEAT, SIM_BANDS = 4, 20
+ROLL_DIM = 2 * (12 + 9 + MEM_TICKS) + 6 + 12 + 1 + 2
+SLOT_TICKS = TICKS // 6
+HIT_SLOTS = (CONTEXT + WINDOW + AHEAD) * 6
+HIT_DIM = SLOT_TICKS + 1
+REPEAT_SIM = (0.8, 0.9)
 
 
 def beat_to_sec(beat, beat_times):
@@ -56,6 +66,13 @@ def beat_mel(logmel, fps, beat_times, first_beat, n=N_FRAMES, per_beat=FRAMES_PE
     return out / 40.0 + 1.0
 
 
+def window_nps(ev, start, end, beat_times, offset):
+    t = ev["tick"][ev["kind"] == tokens.NOTE]
+    n = np.searchsorted(t, end) - np.searchsorted(t, start)
+    sec = np.diff(beat_to_sec(np.array([start, end]) / TICKS + offset, beat_times))[0]
+    return n / max(sec, 1e-3)
+
+
 def song_overview(logmel, fps, beat_times, offset):
     n_beats = int(np.ceil(sec_to_beat(np.array([len(logmel) / fps]), beat_times)[0]))
     bar = max(4, int(np.ceil(n_beats / OVERVIEW_BARS)))
@@ -82,6 +99,80 @@ def loss_mask(tk, t0):
         if k == VOCAB.EOS or (tick is not None and tick >= boundary and k >= VOCAB.time0):
             mask[j] = 1
     return mask
+
+
+def beat_prints(logmel, fps, beat_times, offset, first, n):
+    m = beat_mel(logmel, fps, beat_times, first + offset, n=n * SIM_PER_BEAT, per_beat=SIM_PER_BEAT)
+    m = m.reshape(len(m), SIM_BANDS, -1).mean(2)
+    m = (m - m.mean(0)) / (m.std(0) + 1e-3)
+    return m.reshape(n, -1)
+
+
+def best_match(prints, first, start, lo):
+    s, hi = start - first, start - MEM_BEATS - first
+    lo = max(lo - first, 0)
+    if hi < lo or s + MEM_BEATS > len(prints):
+        return None, 0.0
+    target = prints[s:s + MEM_BEATS]
+    g = prints[lo:hi + MEM_BEATS] @ target.T
+    k = np.arange(hi - lo + 1)[:, None] + np.arange(MEM_BEATS)
+    dots = g[k, np.arange(MEM_BEATS)].sum(1)
+    sq = np.concatenate([[0], np.cumsum((prints[lo:hi + MEM_BEATS] ** 2).sum(1))])
+    norms = np.sqrt(sq[MEM_BEATS:] - sq[:-MEM_BEATS] + 1e-6) * np.sqrt((target ** 2).sum() + 1e-6)
+    sim = dots / norms
+    j = int(np.argmax(sim))
+    return lo + j + first, float(sim[j])
+
+
+def memory_roll(ev, start):
+    roll = np.zeros((MEM_SLOTS, ROLL_DIM), np.float32)
+    t = ev["tick"] - start * TICKS
+    e = ev[(t >= 0) & (t < MEM_BEATS * TICKS)]
+    t = e["tick"] - start * TICKS
+    slot, sub, h = t // MEM_TICKS, t % MEM_TICKS, np.clip(e["hand"], 0, 1)
+    per_hand = 12 + 9 + MEM_TICKS
+    base = 2 * per_hand
+    n = e["kind"] == tokens.NOTE
+    roll[slot[n], h[n] * per_hand + e["cell"][n]] = 1
+    roll[slot[n], h[n] * per_hand + 12 + e["dir"][n]] = 1
+    roll[slot[n], h[n] * per_hand + 21 + sub[n]] = 1
+    w = e["kind"] == tokens.SWING
+    face = np.where(e["air"][w], 2, np.where(e["forehand"][w], 0, 1))
+    roll[slot[w], base + h[w] * 3 + face] = 1
+    bm = e["kind"] == tokens.BOMB
+    roll[slot[bm], base + 6 + e["cell"][bm]] = 1
+    roll[slot[e["kind"] == tokens.WALL], base + 18] = 1
+    a = e["kind"] == tokens.ARC
+    roll[slot[a], base + 19 + h[a]] = 1
+    return roll
+
+
+def memory_match(lo, b, logmel, fps, beat_times, offset):
+    if lo is None:
+        return None, 0.0
+    start, first = b + CONTEXT, min(lo, b)
+    prints = beat_prints(logmel, fps, beat_times, offset, first, start + MEM_BEATS - first)
+    return best_match(prints, first, start, lo)
+
+
+def memory_input(ev, lo, b, logmel, fps, beat_times, offset, per_beat=FRAMES_PER_BEAT):
+    m, sim = memory_match(lo, b, logmel, fps, beat_times, offset)
+    if m is None:
+        return (np.zeros((MEM_BEATS * per_beat, logmel.shape[1]), np.float32), np.zeros((MEM_SLOTS, ROLL_DIM), np.float32),
+                np.zeros(2, np.float32))
+    return (beat_mel(logmel, fps, beat_times, m + offset, n=MEM_BEATS * per_beat, per_beat=per_beat), memory_roll(ev, m),
+            np.array([sim, 1.0], np.float32))
+
+
+def hit_roll(ticks, t0):
+    out = np.zeros((HIT_SLOTS, HIT_DIM), np.float32)
+    if ticks is None:
+        return out
+    out[:, -1] = 1
+    rel = np.asarray(ticks, np.int64) - t0
+    rel = rel[(rel >= 0) & (rel < HIT_SLOTS * SLOT_TICKS)]
+    out[rel // SLOT_TICKS, rel % SLOT_TICKS] = 1
+    return out
 
 
 def mapper_key(r):

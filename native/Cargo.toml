@@ -1,0 +1,17 @@
+[package]
+name = "bsrules"
+version = "0.1.0"
+edition = "2024"
+description = "The map sampler's rules in Rust (bsgen._rules); build with scripts/build_native.py"
+
+[lib]
+name = "_rules"
+crate-type = ["cdylib"]
+
+[dependencies]
+numpy = "0.30.0"
+pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py310"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
