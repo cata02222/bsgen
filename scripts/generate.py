@@ -338,12 +338,13 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         if rhythm_model is None or args.human_times:
             return [None] * len(jobs)
         out = [None] * len(jobs)
-        use = [j for j, (ask, _) in enumerate(jobs) if not auto_rhythm or ask >= rhythm.AUTO_STARS]
+        use = [j for j, (ask, *_) in enumerate(jobs) if not auto_rhythm or ask >= rhythm.AUTO_STARS]
         style = max(styles, key=styles.get) if styles else None
         for c in range(0, len(use), RHYTHM_BATCH):
             part = use[c:c + RHYTHM_BATCH]
-            plans = [plan(*jobs[j]) for j in part]
+            plans = [plan(*jobs[j][:2]) for j in part]
             asks = [jobs[j][0] for j in part]
+            wanted = [jobs[j][2] for j in part]
             levels = [aim and aim["hps"] for aim, _ in plans]
             ratings = [None if k["tech"] is None and k["pass"] is None else (k["tech"], k["pass"]) for _, k in plans]
             for i, ask in enumerate(asks):
@@ -357,7 +358,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             got = rhythm.best_of(rhythm_model, logmel, fps, grid_times, 0.0, n_beats, asks[0] if one else asks,
                                  args.rhythm_tries, level=levels[0] if one else levels, style=style,
                                  temp=args.rhythm_temp, top_p=args.rhythm_top_p, cfg=args.rhythm_cfg, dev=args.device,
-                                 gen=rgen, ratings=ratings[0] if one else ratings, audio_cfg=args.rhythm_audio_cfg)
+                                 gen=rgen, ratings=ratings[0] if one else ratings, audio_cfg=args.rhythm_audio_cfg,
+                                 wanted=wanted[0] if one else wanted)
             for j, t in zip(part, [got] if one else got):
                 out[j] = t
         return out
@@ -384,7 +386,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                                     candidates=args.candidates, controls=controls, styles=styles,
                                     max_loop=args.max_loop, dry=args.dry, xtc=args.xtc, min_p=args.min_p,
                                     turn=args.turn, hold=args.hold, times=times, arc_boost=args.arc_boost, arc_rate=args.arc_rate, music_fit=args.music_fit, off_grid=args.off_grid, repeat=args.repeat,
-                                    use_plan=not args.no_plan, hooks=hooks, gen=gen, rng=rng,
+                                    use_plan=not args.no_plan, hooks=hooks, gen=gen, rng=rng, floor=sample.xtc_floor(star), top=sample.top_bias(star),
                                     progress=lambda beat: progress(name, beat, n_beats) if progress else None)
         bombs, walls, arcs = tokens.to_objects(ev, offset)
         notes = tokens.to_notes(ev, offset)
@@ -453,7 +455,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             if not todo:
                 break
             quiet = (lambda m: None) if k > 1 and not args.verbose else None
-            times = rhythms([(a, njs[i]) for i, _, a in todo])
+            times = rhythms([(a, njs[i], stars[i]) for i, _, a in todo])
             for (i, _, _), lv in zip(todo, ex.map(lambda t, h: level(stars[t[0]], names[t[0]], njs[t[0]], t[2], h,
                                                                      progress if t[1] == 0 else None,
                                                                      None if t[1] == 0 else quiet), todo, times)):

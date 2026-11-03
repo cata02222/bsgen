@@ -16,6 +16,19 @@ def typical_njs(stars):
     return round(float(np.interp(stars, NJS_STARS, NJS_MEDIAN)) * 2) / 2
 
 
+REACTION_STARS = [2, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 13]
+REACTION_MS = [1009, 879, 771, 714, 643, 600, 558, 540, 500, 475, 464]
+
+
+def spawn_offset(stars, njs, bpm):
+    beat = 60 / bpm
+    half = 4.0
+    while njs * beat * half > 17.999 and half > 0.25:
+        half /= 2
+    want = float(np.interp(stars, REACTION_STARS, REACTION_MS)) / 1000 / beat
+    return round(max(want, 0.25) - half, 3)
+
+
 def difficulty_for(stars):
     for name, top in (("Easy", 4.1), ("Normal", 5.0), ("Hard", 6.5), ("Expert", 9.0)):
         if stars < top:
@@ -99,7 +112,8 @@ def write_pack(folder: Path, audio: bytes, bpm: float, title: str, levels, tempo
             "_difficultyBeatmaps": [{
                 "_difficulty": lv["difficulty"], "_difficultyRank": DIFF_RANK[lv["difficulty"]],
                 "_beatmapFilename": f"{lv['difficulty']}Standard.dat",
-                "_noteJumpMovementSpeed": lv["njs"], "_noteJumpStartBeatOffset": 0,
+                "_noteJumpMovementSpeed": lv["njs"],
+                "_noteJumpStartBeatOffset": spawn_offset(lv["stars"], lv["njs"], bpm) if lv.get("stars") else 0,
                 "_customData": {"_difficultyLabel": lv["label"], "_information": [description]},
             } for lv in levels],
         }],

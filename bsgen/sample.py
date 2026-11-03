@@ -83,6 +83,14 @@ def near_gap_ticks(beat_times):
     return int(np.ceil(NEAR_GAP_S / spb * TICKS))
 
 
+VISION_GAP_S = 0.3
+
+
+def vision_gap_ticks(beat_times):
+    spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
+    return int(np.ceil(VISION_GAP_S / spb * TICKS))
+
+
 WALL_SWITCH_S = 0.60
 
 
@@ -138,6 +146,23 @@ LOOP_PENALTY = 4.0
 VARIETY_BEATS, VARIETY_NOTES, VARIETY_FLOOR, VARIETY_PENALTY = 16, 32, 12, 0.75
 DRY_BASE, DRY_ALLOWED, DRY_WINDOW, DRY_GROW = 1.75, 6, 512, 8
 XTC_THRESHOLD = 0.1
+XTC_FLOOR_STARS = (6.5, 8.0)
+XTC_FLOOR = (0.0, 0.03)
+
+
+def xtc_floor(stars):
+    return float(np.interp(stars, XTC_FLOOR_STARS, XTC_FLOOR))
+
+
+TOP_BIAS_STARS = (4.0, 6.0, 7.5, 9.0, 11.0)
+TOP_BIAS = (0.1, 0.2, 0.26, 0.25, 0.0)
+TOP_NOTES = [VOCAB.note(h, c, d) for h in (0, 1) for c in range(8, 12) for d in range(9)]
+
+
+def top_bias(stars):
+    return float(np.interp(stars, TOP_BIAS_STARS, TOP_BIAS))
+
+
 NO_NOTE = 108
 TURN_PENALTY, TURN_RATE = 2.5, 0.05
 HOLD, HOLD_FROM, HOLD_GROW, HOLD_MAX = 0.0, 16, 16, 3
@@ -265,7 +290,7 @@ class Rules:
 
     def __init__(self, prefix_events, end_tick, swings=True, objects=OBJ_WALLS | OBJ_BOMBS | OBJ_ARCS,
                  max_loop=MAX_LOOP, behind=TICKS // 2, dry=0.0, turn=0.0, copy=None, hold=0.0, times=None,
-                 double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0):
+                 double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0, vision_gap=0):
         self.end, self.swings, self.objects, self.turn, self.hold = end_tick, swings, objects, turn, hold
         self.times = None if times is None else np.asarray(times, np.int64)
         self.time_set = set() if times is None else set(self.times.tolist())
@@ -277,6 +302,7 @@ class Rules:
         self.cell_gap, self.cell_tick = cell_gap, {}
         self.bomb_tick = {}
         self.near_gap, self.cols = near_gap, {0: None, 1: None}
+        self.vision_gap, self.front_tick = vision_gap, {0: None, 1: None}
         self.swings_n = self.air_free_n = 0
         self.moments_n = self.doubles_n = 0
         self.head = {0: None, 1: None}
@@ -482,6 +508,8 @@ class Rules:
         return out
 
     def _col(self, h, cell):
+        if cell in (5, 6):
+            self.front_tick[h] = (self.tick, cell)
         if self.cols[h] is not None and self.cols[h][0] == self.tick:
             self.cols[h][1].add(cell % 4)
         else:
@@ -491,11 +519,15 @@ class Rules:
         other = [c % 4 for g, c in self.cells if g == 1 - h]
         near = self.cols[1 - h]
         near = near[1] if near and self.near_gap and 0 < self.tick - near[0] < self.near_gap else None
-        if not other and not near:
+        front = self.front_tick[1 - h]
+        hidden = self.vision_gap and front is not None and 0 < self.tick - front[0] < self.vision_gap
+        if not other and not near and not hidden:
             return cells
         own = [c % 4 for g, c in self.cells if g == h]
 
         def fine(c):
+            if hidden and (c % 4 <= 1) == (front[1] == 5):
+                return False
             if near and (c % 4 >= min(near) if h == 0 else c % 4 <= max(near)):
                 return False
             if not other:
@@ -737,13 +769,13 @@ def native_consts():
 
 
 def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry, turn, copy, hold, times,
-                 double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap):
+                 double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap):
     e = prefix_events
     return NATIVE.Rules(native_consts(), e["tick"], e["kind"], e["hand"], e["forehand"], e["air"], e["cell"],
                         e["dir"], e["shape"], e["dur"], int(end_tick), bool(swings), int(objects), int(max_loop),
                         int(behind), float(dry), float(turn), None if copy is None else (int(copy[0]), int(copy[1])),
                         float(hold), None if times is None else [int(t) for t in times], int(double_gap),
-                        int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap))
+                        int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap), int(vision_gap))
 
 
 GRAPHS = True
@@ -837,7 +869,7 @@ def give_graph(model, graph):
 
 @torch.no_grad()
 def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev, xtc=0.0, min_p=0.0, arc_boost=0.0,
-                  hooks=(), gen=None, rng=None, dot_bias=0.0):
+                  hooks=(), gen=None, rng=None, dot_bias=0.0, xtc_floor=0.0, top_bias=0.0):
     n, k = len(rules), len(prefixes) - 1
     guided = cfg != 1.0 or k > 1
     use_graph = str(dev).startswith("cuda") and GRAPHS
@@ -911,6 +943,8 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                     lg[:, VOCAB.arc0:VOCAB.arc0 + 2] += arc_boost
                 if dot_bias:
                     lg[:, VOCAB.note0 + 8:VOCAB.note0 + 24 * 9:9] -= dot_bias
+                if top_bias:
+                    lg[:, TOP_NOTES] -= top_bias
                 if pen:
                     ri, ti, amt = zip(*pen)
                     lg.index_put_((torch.tensor(ri), torch.tensor(ti)), -torch.tensor(amt, dtype=lg.dtype), accumulate=True)
@@ -933,6 +967,8 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                             top = torch.nonzero(pr[i] >= XTC_THRESHOLD)[:, 0]
                             if len(top) >= 2:
                                 pr[i, top[pr[i, top] > pr[i, top].min()]] = 0
+                                if xtc_floor:
+                                    pr[i, pr[i] < xtc_floor] = 0
                 sp, si = torch.sort(pr, -1, descending=True)
                 if min_p > 0:
                     sp[sp < min_p * sp[:, :1]] = 0
@@ -976,13 +1012,13 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                         lg = logits()
                 if native:
                     st, a = early or prep(), lg.numpy()
-                    bp = NATIVE.adjust(st, a, temp, arc_boost, dot_bias, VOCAB.note0, VOCAB.arc0)
+                    bp = NATIVE.adjust(st, a, temp, arc_boost, dot_bias, top_bias, VOCAB.note0, VOCAB.arc0)
                     for hook in hooks:
                         hook(lg, rules)
                     cut = [xtc > 0 and not done[i] and r.need_note is not None and rng.random() < xtc
                            for i, r in enumerate(rules)]
                     ks = NATIVE.finish(st, a, temp, top_p, min_p, torch.rand(len(rules), generator=gen).tolist(),
-                                       cut, XTC_THRESHOLD, VOCAB.time0, VOCAB.swing0, VOCAB.EOS)
+                                       cut, XTC_THRESHOLD, xtc_floor, VOCAB.time0, VOCAB.swing0, VOCAB.EOS)
                 else:
                     ks, bp = draw_python(lg, early or prep())
                 for i, t in enumerate(ks):
@@ -1080,7 +1116,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
              dev="cuda", log=None, candidates=1, controls=None, styles=None, max_loop=MAX_LOOP, dry=0.0, xtc=0.0,
              min_p=0.0, arc_boost=0.0, arc_rate=0.0, hooks=(), gen=None, rng=None, progress=None,
              turn=TURN_PENALTY, turn_rate=TURN_RATE, typical_ratings=True, music_fit=False, off_grid=0.0, repeat=0.0,
-             steady=True, use_plan=True, plan_cfg=PLAN_CFG, hold=HOLD, times=None):
+             steady=True, use_plan=True, plan_cfg=PLAN_CFG, hold=HOLD, times=None, floor=None, top=None):
     if gen is not None and gen.device.type != "cpu":
         gen = torch.Generator().manual_seed(gen.initial_seed())
     plan_nps = None
@@ -1118,6 +1154,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     ov, bar = song_overview(logmel, fps, beat_times, offset)
     behind = behind_wall_ticks((c.get("njs") if getattr(model, "controls", False) else None) or 18.0, beat_times)
     double_gap, cell_gap, near_gap = double_gap_ticks(beat_times), cell_gap_ticks(beat_times), near_gap_ticks(beat_times)
+    vision_gap = vision_gap_ticks(beat_times)
     wall_gap = wall_switch_ticks(beat_times)
     swing_gap = swing_gap_ticks(beat_times, stars)
     uncross = stars is not None and stars < UNCROSS_STARS
@@ -1163,7 +1200,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             rules = []
             for _ in range(candidates):
                 r = make_rules(ev, end, swings, allow, max_loop, behind, dry, turn_now, copy, hold, times,
-                               double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap)
+                               double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap)
                 r.begin(t0, new0 - 1)
                 rules.append(r)
             boost = arc_boost
@@ -1171,7 +1208,9 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
                 under = np.sum(ev["kind"] == ARC) < arc_rate * max(np.sum(ev["kind"] == NOTE), 1)
                 boost = ARC_PUSH if under else -ARC_PUSH
             new, bl = sample_window(model, audio, prefixes, wweights, rules, cfg, temp, top_p, dev, xtc, min_p, boost,
-                                    window_hooks, gen, rng, dot_bias=dot_bias(temp))
+                                    window_hooks, gen, rng, dot_bias=dot_bias(temp),
+                                    xtc_floor=xtc_floor(stars) if floor is None else floor,
+                                    top_bias=top_bias(stars) if top is None else top)
             got = [tokens.decode(prefixes[1] + t, t0) for t in new]
             return [g[g["tick"] >= new0] for g in got], bl
 

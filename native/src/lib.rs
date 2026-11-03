@@ -310,6 +310,8 @@ struct State {
     bomb_tick: [Option<i64>; 12],
     near_gap: i64,
     wall_gap: i64,
+    vision_gap: i64,
+    front_tick: [Option<(i64, i64)>; 2],
     cols: [Option<(i64, u8)>; 2],
     moments_n: i64,
     doubles_n: i64,
@@ -504,6 +506,9 @@ impl State {
 
     fn col(&mut self, h: usize, cell: i64) {
         let t = self.tick.unwrap();
+        if cell == 5 || cell == 6 {
+            self.front_tick[h] = Some((t, cell));
+        }
         match &mut self.cols[h] {
             Some((ct, m)) if *ct == t => *m |= 1 << (cell % 4),
             slot => *slot = Some((t, 1 << (cell % 4))),
@@ -545,12 +550,16 @@ impl State {
             Some((ct, m)) if self.near_gap != 0 && 0 < t - ct && t - ct < self.near_gap => Some(m),
             _ => None,
         };
-        if other.is_empty() && near.is_none() {
+        let front = self.front_tick[1 - h].filter(|&(f, _)| self.vision_gap != 0 && 0 < t - f && t - f < self.vision_gap);
+        if other.is_empty() && near.is_none() && front.is_none() {
             return cells;
         }
         let own: Vec<i64> = self.cells.iter().filter(|&&(g, _)| g as usize == h).map(|&(_, c)| c as i64 % 4).collect();
         let fine = |c: i64| -> bool {
             let col = c % 4;
+            if front.is_some_and(|(_, cell)| (col <= 1) == (cell == 5)) {
+                return false;
+            }
             if let Some(m) = near {
                 let lo = m.trailing_zeros() as i64;
                 let hi = 7 - m.leading_zeros() as i64;
@@ -1002,7 +1011,7 @@ impl Rules {
     #[new]
     #[pyo3(signature = (consts, tick, kind, hand, forehand, air, cell, dir, shape, dur, end_tick, swings, objects,
                         max_loop, behind, dry, turn, copy, hold, times, double_gap, cell_gap, swing_gap, uncross, near_gap,
-                        wall_gap))]
+                        wall_gap, vision_gap))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         consts: &NativeConsts,
@@ -1031,6 +1040,7 @@ impl Rules {
         uncross: bool,
         near_gap: i64,
         wall_gap: i64,
+        vision_gap: i64,
     ) -> PyResult<Self> {
         let c = consts.c.clone();
         let mut s = State {
@@ -1051,6 +1061,8 @@ impl Rules {
             bomb_tick: [None; 12],
             near_gap,
             wall_gap,
+            vision_gap,
+            front_tick: [None, None],
             cols: [None, None],
             moments_n: 0,
             doubles_n: 0,
@@ -1279,7 +1291,7 @@ fn rows<'a>(lg: &'a mut PyReadwriteArray2<'_, f32>, step: &Step) -> PyResult<&'a
 
 #[pyfunction]
 fn adjust(py: Python<'_>, step: &Step, mut lg: PyReadwriteArray2<'_, f32>, temp: f32, arc_boost: f32, dot_bias: f32,
-          note0: usize, arc0: usize) -> PyResult<Vec<f64>> {
+          top_bias: f32, note0: usize, arc0: usize) -> PyResult<Vec<f64>> {
     let a = rows(&mut lg, step)?;
     Ok(py.detach(|| {
         let v = step.vocab;
@@ -1307,6 +1319,13 @@ fn adjust(py: Python<'_>, step: &Step, mut lg: PyReadwriteArray2<'_, f32>, temp:
                     row[t] -= dot_bias;
                 }
             }
+            if top_bias != 0.0 {
+                for t in note0..(note0 + 24 * 9).min(v) {
+                    if (t - note0) / 9 % 12 >= 8 {
+                        row[t] -= top_bias;
+                    }
+                }
+            }
         }
         for &(i, t, amt) in &step.pen {
             if t < v {
@@ -1328,7 +1347,7 @@ fn logsumexp(x: impl Iterator<Item = f32> + Clone) -> f32 {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn finish(py: Python<'_>, step: &Step, mut lg: PyReadwriteArray2<'_, f32>, temp: f32, top_p: f32, min_p: f32,
-          u: Vec<f32>, xtc: Vec<bool>, xtc_threshold: f32, time0: usize, swing0: usize, eos: usize)
+          u: Vec<f32>, xtc: Vec<bool>, xtc_threshold: f32, xtc_floor: f32, time0: usize, swing0: usize, eos: usize)
           -> PyResult<Vec<usize>> {
     let a = rows(&mut lg, step)?;
     py.detach(|| {
@@ -1366,6 +1385,11 @@ fn finish(py: Python<'_>, step: &Step, mut lg: PyReadwriteArray2<'_, f32>, temp:
                     for &j in &top {
                         if cand[j].0 > least {
                             cand[j].0 = 0.0;
+                        }
+                    }
+                    for c in cand.iter_mut() {
+                        if c.0 < xtc_floor {
+                            c.0 = 0.0;
                         }
                     }
                 }

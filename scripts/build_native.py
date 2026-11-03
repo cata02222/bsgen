@@ -15,7 +15,9 @@ def main():
     if sys.platform == "darwin":
         lib = lib.with_suffix(".dylib")
     out = ROOT / "bsgen" / ("_rules.pyd" if os.name == "nt" else "_rules.abi3.so")
-    shutil.copyfile(lib, out)
+    tmp = out.with_name(out.name + ".new")
+    shutil.copyfile(lib, tmp)
+    os.replace(tmp, out)
     print(f"wrote {out.relative_to(ROOT)}")
 
 

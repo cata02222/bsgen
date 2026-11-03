@@ -48,6 +48,14 @@ The 1.0 and 1.1 map models are still in the menu under Expert.
 
 ## Changelog
 
+**1.2.1**
+- reaction time and jump distance match ranked maps at each star level, on any song
+- fewer sudden hard parts when a song builds up
+- fewer odd patterns at high stars
+- notes rarely hide the one after them
+- fewer notes on the top row
+- replays: fixed how notes are marked, for in-game replays
+
 **1.2**
 - new map model, trained from scratch on more songs
 - a rhythm model picks the hits first

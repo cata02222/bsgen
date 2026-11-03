@@ -383,6 +383,10 @@ SPIKE_MAX = {"acc": 2.9, "speed": 4.5}
 PEAK_MAX = {"acc": 8.0}
 SPIKE_DEFAULT = 3.5
 
+BURST_SECS = 2.0
+BURST_STARS = (2, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 13)
+BURST_MAX = (4.5, 6.5, 8.5, 9.6, 12.5, 14.0, 17.0, 19.5, 22.5, 27.5, 29.6)
+
 
 def spike(ticks, beat_times, offset):
     sec = np.sort(beat_to_sec(np.unique(np.asarray(ticks)) / TICKS + offset, beat_times))
@@ -391,6 +395,13 @@ def spike(ticks, beat_times, offset):
     n = np.histogram(sec, np.append(np.arange(sec[0], sec[-1], 8.0), sec[-1] + 1e-9))[0] / 8
     peak = max(float(np.max([((sec >= a) & (sec < a + 8)).sum() / 8 for a in sec[::4]])), float(n.max()))
     return peak / max(float(np.median(n)), 0.1), peak
+
+
+def burst(ticks, beat_times, offset):
+    sec = np.sort(beat_to_sec(np.unique(np.asarray(ticks)) / TICKS + offset, beat_times))
+    if len(sec) < 2:
+        return 0.0
+    return float((np.searchsorted(sec, sec + BURST_SECS, "left") - np.arange(len(sec))).max()) / BURST_SECS
 
 
 def star_cfg(stars):
@@ -420,7 +431,7 @@ def star_sampling(stars):
 
 
 def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES, level=None, cfg=None, temp=None,
-            top_p=None, ratings=None, **kw):
+            top_p=None, ratings=None, wanted=None, **kw):
     many = not np.isscalar(stars)
     sl = list(stars) if many else [stars]
     m = len(sl)
@@ -461,7 +472,7 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
                                    beat_times))[0]
         return 4 * thin + drop / 32 + abs(np.log(len(t) / max(span, 1.0) / want)) + loud
     picks = []
-    for g, x, v in zip(gens, sl, lvl):
+    for g, x, v, aim in zip(gens, sl, lvl, sl if wanted is None else wanted if many else [wanted]):
         want = v if v is not None and v == v else usual_level(model, x) if model.usual else None
         floor = float(np.interp(x, EVEN_STARS, EVEN_MIN))
         even = [t for t in g if evenness(t, beat_times, offset) >= floor] or g
@@ -472,6 +483,9 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
         calm = [t for t, (r, p) in zip(varied, spikes) if r <= cap and p <= peak_cap]
         if not calm:
             calm = [min(zip(varied, spikes), key=lambda q: max(q[1][0] / cap, q[1][1] / peak_cap))[0]]
+        most = float(np.interp(aim, BURST_STARS, BURST_MAX))
+        rates = [burst(t, beat_times, offset) for t in calm]
+        calm = [t for t, r in zip(calm, rates) if r <= most] or [calm[int(np.argmin(rates))]]
         picks.append(min(calm, key=lambda t: score(t, want)))
     return picks if many else picks[0]
 
