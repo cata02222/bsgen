@@ -1,6 +1,6 @@
 [project]
 name = "bsgen"
-version = "1.2.1"
+version = "1.2.2"
 description = "Beat Saber maps from any song"
 readme = "README.md"
 license = "AGPL-3.0-or-later"

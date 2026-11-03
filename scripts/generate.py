@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from itertools import product
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -44,6 +45,25 @@ def next_asks(star, made, k, climb=STAR_CLIMB):
     asks = [float(np.clip(aim + d, 0.5, top)) for d in np.linspace(-0.4, 0.4, k)]
     asks = sorted({round(x, 2) for x in asks if np.min(np.abs(a - x)) > 0.2})
     return asks
+
+
+STAR_ORDER_GAP = 0.5
+
+
+def pick_levels(stars, made):
+    near = lambda s, lv: abs(lv["est"] - s) if lv["est"] else 0.0
+    nearest = [min(m, key=lambda lv: near(s, lv)) for s, m in zip(stars, made)]
+    if any(lv["est"] is None for m in made for lv in m):
+        return nearest, True
+    order = sorted(range(len(stars)), key=lambda i: stars[i])
+
+    def rising(pick):
+        return all(stars[b] == stars[a] or pick[b]["est"] - pick[a]["est"] >= min(STAR_ORDER_GAP, (stars[b] - stars[a]) / 2)
+                   for a, b in zip(order, order[1:]))
+    fits = [p for p in product(*made) if rising(p)]
+    if not fits:
+        return nearest, False
+    return list(min(fits, key=lambda p: sum(near(s, lv) for s, lv in zip(stars, p)))), True
 
 
 def ogg_vorbis(path):
@@ -465,7 +485,9 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 if asks[i] and round_ + 1 < rounds:
                     best = min(m, key=lambda lv: abs(lv["est"] - s))
                     log(f"{names[i]}: remaking, rated {best['est']:.1f}★ of {s:g} asked")
-        levels = [min(m, key=lambda lv: abs(lv["est"] - s) if lv["est"] else 0.0) for s, m in zip(stars, made)]
+        levels, in_order = pick_levels(stars, made)
+        if not in_order:
+            log("the difficulties' ratings don't rise with their stars on this song; try another seed")
         for s, lv, m in zip(stars, levels, made):
             if len(m) > 1:
                 log(f"{lv['difficulty']}: kept the one made at {lv['ask']:g}★, rated {lv['est']:.1f}★ of {s:g} asked"
