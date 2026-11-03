@@ -258,7 +258,7 @@ def note_events(notes, motion, height):
         elif fb >= 0:
             f, kind, saber = fb, 1, bad_saber[k]
         else:
-            out.append((sec, x, y, c, d, 2, sec + MISS_AFTER, 0, 0.0, 0.0, 0.0, 0.0, np.zeros(3)))
+            out.append((sec, x, y, c, d, 2, sec + MISS_AFTER, 0, 0.0, 0.0, 0.0, 0.0, np.zeros(3), np.zeros(3)))
             continue
         j = f - int(round(sec * FPS)) - BAND[0]
         pre, post = band[k, max(j - RATE_BEFORE, 0):max(j, 0)], band[k, max(j, 0):j + RATE_AFTER]
@@ -273,7 +273,7 @@ def note_events(notes, motion, height):
         centre = np.array([LANES[min(max(x, 0), 3)], rows[min(max(y, 0), 2)], (sec - f / FPS) * notes.njs + 0.65])
         speed = float(np.linalg.norm(v))
         out.append((sec, x, y, c, d, kind, f / FPS, saber, float(before), float(after),
-                    abs(float(normal @ (centre - h))), speed, v / (speed + 1e-9)))
+                    abs(float(normal @ (centre - h))), speed, v / (speed + 1e-9), normal))
     return out
 
 
