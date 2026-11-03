@@ -379,6 +379,20 @@ def bar_repeat(ticks):
                for i in range(len(keys) - REPEAT_BARS + 1)) / REPEAT_BARS
 
 
+SPIKE_MAX = {"acc": 2.9, "speed": 4.5}
+PEAK_MAX = {"acc": 8.0}
+SPIKE_DEFAULT = 3.5
+
+
+def spike(ticks, beat_times, offset):
+    sec = np.sort(beat_to_sec(np.unique(np.asarray(ticks)) / TICKS + offset, beat_times))
+    if len(sec) < 10:
+        return 1.0, 0.0
+    n = np.histogram(sec, np.append(np.arange(sec[0], sec[-1], 8.0), sec[-1] + 1e-9))[0] / 8
+    peak = max(float(np.max([((sec >= a) & (sec < a + 8)).sum() / 8 for a in sec[::4]])), float(n.max()))
+    return peak / max(float(np.median(n)), 0.1), peak
+
+
 def star_cfg(stars):
     return float(np.interp(stars, CFG_STARS, CFG))
 
@@ -415,6 +429,7 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
     cf = [star_cfg(x) if cfg is None else cfg for x in sl]
     tp = [star_sampling(x) for x in sl]
     te, pp = [t if temp is None else temp for t, _ in tp], [p if top_p is None else top_p for _, p in tp]
+    style = kw.get("style")
     gens = [[] for _ in sl]
     for k in range(0, tries, TRIES_CHUNK):
         c = min(TRIES_CHUNK, tries - k)
@@ -451,8 +466,13 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
         floor = float(np.interp(x, EVEN_STARS, EVEN_MIN))
         even = [t for t in g if evenness(t, beat_times, offset) >= floor] or g
         top = float(np.interp(x, REPEAT_STARS, REPEAT_MAX))
-        varied = [t for t in even if bar_repeat(t) <= top]
-        picks.append(min(varied or even, key=lambda t: score(t, want)))
+        varied = [t for t in even if bar_repeat(t) <= top] or even
+        cap, peak_cap = SPIKE_MAX.get(style, SPIKE_DEFAULT), PEAK_MAX.get(style, np.inf)
+        spikes = [spike(t, beat_times, offset) for t in varied]
+        calm = [t for t, (r, p) in zip(varied, spikes) if r <= cap and p <= peak_cap]
+        if not calm:
+            calm = [min(zip(varied, spikes), key=lambda q: max(q[1][0] / cap, q[1][1] / peak_cap))[0]]
+        picks.append(min(calm, key=lambda t: score(t, want)))
     return picks if many else picks[0]
 
 

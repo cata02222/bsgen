@@ -15,6 +15,7 @@ dependencies = [
     "scipy>=1.10",
     "soundfile>=0.12",
     "torch>=2.4",
+    "yt-dlp>=2026.10.26",
 ]
 
 [build-system]

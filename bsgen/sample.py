@@ -15,8 +15,8 @@ from .model import Generator, GraphStep, SharedStep
 from .stats import off_flow
 from .tokens import ARC, BOMB, CONTEXT, NOTE, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, SWING, TICKS, VOCAB, WALL, WINDOW
 
-FOREHAND_DIRS = {1, 6, 7, 2, 3, 8}
-BACKHAND_DIRS = {0, 4, 5, 2, 3, 8}
+FOREHAND_DIRS = {0: {1, 6, 7, 3, 8}, 1: {1, 6, 7, 2, 8}}
+BACKHAND_DIRS = {0: {0, 4, 5, 2, 8}, 1: {0, 4, 5, 3, 8}}
 OPENING_DIRS = {1, 6, 7, 8}
 DIR_ANGLE = {0: 180, 1: 0, 2: 270, 3: 90, 4: 225, 5: 135, 6: 315, 7: 45}
 SLIDE_TURN = 45
@@ -141,6 +141,7 @@ XTC_THRESHOLD = 0.1
 NO_NOTE = 108
 TURN_PENALTY, TURN_RATE = 2.5, 0.05
 HOLD, HOLD_FROM, HOLD_GROW, HOLD_MAX = 0.0, 16, 16, 3
+AIR_RATE, AIR_FROM, AIR_PUSH, AIR_MAX = 0.02, 40, 1.0, 3.0
 DOUBLE_SHARE, DOUBLE_FROM, DOUBLE_PUSH, DOUBLE_MAX = 0.35, 64, 2.0, 4.0
 RATING_STARS = [1, 3, 5, 7, 9, 11, 13, 15]
 TYPICAL_RATINGS = {"pass": [0.31, 1.36, 2.76, 4.37, 6.30, 8.41, 10.15, 10.55],
@@ -159,8 +160,12 @@ STYLE_NPS = {"acc": [1.18, 2.55, 3.56, 3.45], "tech": [3.73, 4.96, 5.87, 7.21, 8
              "midspeed": [4.54, 5.39, 7.16, 8.75, 11.44], "speed": [7.97, 9.74, 11.12]}
 
 
+def style_above(stars, style):
+    return style in STYLE_RATINGS and stars is not None and stars > STYLE_RATINGS[style][0][-1] + 1
+
+
 def typical_ratings_for(stars, style=None, every=False):
-    if style in STYLE_RATINGS and STYLE_RATINGS[style][0][0] - 1 <= stars <= STYLE_RATINGS[style][0][-1] + 1:
+    if style in STYLE_RATINGS and STYLE_RATINGS[style][0][0] - 1 <= stars:
         xs, *vals = STYLE_RATINGS[style]
         out = {k: float(np.interp(stars, xs, v)) for k, v in zip(("pass", "acc", "tech"), vals)}
         return out | {"nps": float(np.interp(stars, xs, STYLE_NPS[style]))}
@@ -272,6 +277,7 @@ class Rules:
         self.cell_gap, self.cell_tick = cell_gap, {}
         self.bomb_tick = {}
         self.near_gap, self.cols = near_gap, {0: None, 1: None}
+        self.swings_n = self.air_free_n = 0
         self.moments_n = self.doubles_n = 0
         self.head = {0: None, 1: None}
         self.rest = {0: None, 1: None}
@@ -361,6 +367,8 @@ class Rules:
             self.rest[h] = None
 
     def _swung(self, h, air):
+        self.swings_n += 1
+        self.air_free_n += bool(air and not self.owe[h] and (self.times is None or self.tick in self.time_set))
         self.rest[h] = (None if self.rest[h] is None else 2 - self.rest[h]) if air else None
         self.owe[h] = False
 
@@ -404,6 +412,16 @@ class Rules:
         amount = min(DOUBLE_PUSH * over / 0.1, DOUBLE_MAX)
         return [(VOCAB.swing(h, f, 0), amount) for h in (0, 1) if self.stack[1 - h] and not self.stack[h]
                 for f in (0, 1)]
+
+    def air_penalty(self):
+        if (self.swings_n < AIR_FROM or self.need_note is not None or self.need_time or self.objects_now
+                or self.tick is None or (self.times is not None and self.tick not in self.time_set)):
+            return []
+        over = self.air_free_n / self.swings_n - AIR_RATE
+        if over <= 0:
+            return []
+        amount = min(AIR_PUSH * over / 0.01, AIR_MAX)
+        return [(VOCAB.swing(h, f, 1), amount) for h in (0, 1) if not self.owe[h] for f in (0, 1)]
 
     def _hit(self):
         if self.hit == self.tick:
@@ -546,7 +564,7 @@ class Rules:
             return ok
         if self.need_note is not None:
             h = self.need_note
-            dirs = FOREHAND_DIRS if self.face[h] else BACKHAND_DIRS
+            dirs = (FOREHAND_DIRS if self.face[h] else BACKHAND_DIRS)[h]
             if not self.opened[h]:
                 dirs = dirs & OPENING_DIRS
             self._put(ok, h, self._sides(h, self._free(self.behind, notes=True)), self.fit(h, dirs), first=True)
@@ -625,7 +643,7 @@ class Rules:
                 ok[VOCAB.swing(h, int(not self.face[h]), 1)] = True
             if not self.air[h] and self.face[h] is not None:
                 self._put(ok, h, *self.slide(h, self._line(h, self._sides(h, note_free, first=False)),
-                                             self.fit(h, FOREHAND_DIRS if self.face[h] else BACKHAND_DIRS)))
+                                             self.fit(h, (FOREHAND_DIRS if self.face[h] else BACKHAND_DIRS)[h])))
         return ok
 
     def push(self, k):
@@ -700,14 +718,15 @@ def native_consts():
         time0=VOCAB.time0, swing0=VOCAB.swing0, note0=VOCAB.note0, arc0=VOCAB.arc0, bomb0=VOCAB.bomb0,
         wall0=VOCAB.wall0, dur0=VOCAB.dur0, events_end=VOCAB.events_end, size=VOCAB.size, eos=VOCAB.EOS,
         ticks=TICKS, kinds=(SWING, NOTE, ARC, BOMB, WALL), slide_turn=SLIDE_TURN,
-        forehand=tuple(sorted(FOREHAND_DIRS)), backhand=tuple(sorted(BACKHAND_DIRS)),
+        forehand=tuple(tuple(sorted(FOREHAND_DIRS[h])) for h in (0, 1)), backhand=tuple(tuple(sorted(BACKHAND_DIRS[h])) for h in (0, 1)),
         opening=tuple(sorted(OPENING_DIRS)), down=tuple(sorted(DOWN_DIRS)), up=tuple(sorted(UP_DIRS)),
         hand_cols=(HAND_COLS[0], HAND_COLS[1]), max_stack=MAX_STACK, arc_cap=float(ARC_CAP), arc_span=ARC_SPAN,
         loop_periods=LOOP_PERIODS, loop_match=float(LOOP_MATCH), loop_penalty=float(LOOP_PENALTY),
         variety_beats=VARIETY_BEATS, variety_notes=VARIETY_NOTES, variety_floor=VARIETY_FLOOR,
         variety_penalty=float(VARIETY_PENALTY), dry_base=float(DRY_BASE), dry_allowed=DRY_ALLOWED,
         dry_window=DRY_WINDOW, dry_grow=DRY_GROW, double_share=float(DOUBLE_SHARE), double_from=DOUBLE_FROM,
-        double_push=float(DOUBLE_PUSH), double_max=float(DOUBLE_MAX), hold_from=float(HOLD_FROM),
+        double_push=float(DOUBLE_PUSH), double_max=float(DOUBLE_MAX), air_rate=float(AIR_RATE),
+        air_from=AIR_FROM, air_push=float(AIR_PUSH), air_max=float(AIR_MAX), hold_from=float(HOLD_FROM),
         hold_grow=float(HOLD_GROW), hold_max=float(HOLD_MAX), obj_walls=OBJ_WALLS, obj_bombs=OBJ_BOMBS,
         obj_arcs=OBJ_ARCS, no_note=NO_NOTE)
     key = tuple(scalars.items())
@@ -882,7 +901,7 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                     return NATIVE.prep(rules, done.tolist(), vocab)
                 allowed = torch.from_numpy(np.stack([eos if done[i] else r.mask()[:vocab] for i, r in enumerate(rules)]))
                 pen = [(i, tok, amount) for i, r in enumerate(rules) if not done[i]
-                       for tok, amount in r.loops.penalty(r) + r.turn_penalty() + r.hold_penalty() + r.double_penalty()]
+                       for tok, amount in r.loops.penalty(r) + r.turn_penalty() + r.hold_penalty() + r.double_penalty() + r.air_penalty()]
                 return allowed, pen, [r.reset_merge() for r in rules]
 
             def draw_python(lg, prepped):

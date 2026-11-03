@@ -20,6 +20,7 @@ GB_PER_DIFFICULTY = 1.0
 STAR_TRIES = 3
 STAR_ROUNDS = 2
 STAR_SPREAD = 2.5
+HITS_PER_NOTE = 0.85
 STAR_CLOSE = 0.75
 STAR_MAX = 16.0
 STAR_CLIMB = 2.5
@@ -63,6 +64,7 @@ def parser():
                     help="one per --stars value (default: from the stars); without --stars each one's "
                          "stars come from the song (bsgen/songstars.py)")
     ap.add_argument("--audio")
+    ap.add_argument("--youtube", metavar="URL", help="a YouTube link to take the song from (instead of --audio)")
     ap.add_argument("--title", help="song title for artwork lookup (default: audio tags or filename)")
     ap.add_argument("--artist", help="song artist for artwork lookup (default: audio tags or filename)")
     ap.add_argument("--cover", help="cover image to use instead of an automatic lookup")
@@ -209,6 +211,22 @@ def legacy_run(args, model=None, log=print, progress=None, player=None):
 
 
 def run(args, model=None, log=print, progress=None, player=None, lighter=None):
+    if not getattr(args, "youtube", None):
+        return make_map(args, model, log, progress, player, lighter)
+    from bsgen import youtube
+    with tempfile.TemporaryDirectory(prefix="bsgen_youtube_") as folder:
+        log("downloading the YouTube audio")
+        try:
+            path, note = youtube.download(args.youtube, folder, say=log)
+            args.audio = str(path)
+            if note:
+                log(note)
+        except youtube.YouTubeError as e:
+            raise SystemExit(str(e)) from None
+        return make_map(args, model, log, progress, player, lighter)
+
+
+def make_map(args, model=None, log=print, progress=None, player=None, lighter=None):
     if args.model in hub.LEGACY and not args.ckpt:
         return legacy_run(args, model, log, progress, player)
     if args.seed is None:
@@ -328,6 +346,11 @@ def run(args, model=None, log=print, progress=None, player=None, lighter=None):
             asks = [jobs[j][0] for j in part]
             levels = [aim and aim["hps"] for aim, _ in plans]
             ratings = [None if k["tech"] is None and k["pass"] is None else (k["tech"], k["pass"]) for _, k in plans]
+            for i, ask in enumerate(asks):
+                if sample.style_above(ask, style):
+                    typ = sample.typical_ratings_for(ask, style)
+                    levels[i] = levels[i] or typ["nps"] * HITS_PER_NOTE
+                    ratings[i] = ratings[i] or (typ["tech"], typ["pass"])
             with sample.GATE.reading():
                 rgen = torch.Generator(device=args.device).manual_seed(args.seed)
             one = len(part) == 1

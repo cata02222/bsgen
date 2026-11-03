@@ -104,6 +104,17 @@ footer {{ display: none !important; }}
 .status .discord a:hover {{ background: #4752c4; border-color: #4752c4; }}
 .status .community a:focus-visible {{ outline: 2px solid #5865f2; outline-offset: 3px; }}
 body.starred .status .star {{ display: none; }}
+#youtube-row {{ flex-wrap: nowrap; align-items: center; gap: 6px; padding: 5px 5px 5px 12px; min-height: 0;
+               background: var(--block-background-fill); border: 1px solid var(--block-border-color);
+               border-radius: var(--radius-md); }}
+#youtube-row .form, #youtube-link, #youtube-link * {{ background: transparent !important; border: none !important; box-shadow: none !important; }}
+#youtube-link, #youtube-link .block, #youtube-link label {{ background: transparent !important; border: none !important;
+               box-shadow: none !important; padding: 0 !important; min-width: 0 !important; }}
+#youtube-link textarea, #youtube-link input {{ background: transparent !important; border: none !important;
+               box-shadow: none !important; padding: 6px 0 !important; height: auto !important; }}
+#youtube-go {{ flex: 0 0 auto !important; min-width: 0 !important; width: auto !important; height: 32px; padding: 0 14px;
+               font-size: var(--text-md); font-weight: 500; line-height: 1; }}
+#youtube-go:hover {{ border-color: {BLUE}; color: {BLUE}; }}
 #song-details {{ flex-wrap: nowrap; align-items: center; }}
 #cover-picker {{ flex: 0 0 132px; min-width: 132px !important; max-width: 132px; }}
 #cover-picker .upload-container {{ min-height: 0; }}
@@ -483,6 +494,19 @@ def build(ckpt, device):
             raise gr.Error(result["error"])
         yield gr.update(value=result["files"], visible=True), view.html(done=True)
 
+    def from_youtube(link):
+        from bsgen import youtube
+        if not (link or "").strip():
+            raise gr.Error("Paste a YouTube link first.")
+        gr.Info("Getting the audio from YouTube…")
+        try:
+            path, note = youtube.download(link, OUT / "youtube" / uuid.uuid4().hex[:10])
+            if note:
+                gr.Warning(note)
+            return str(path)
+        except youtube.YouTubeError as e:
+            raise gr.Error(str(e)) from None
+
     def make(song, mode, diff, count, *rest):
         stars, (style, arcs, extras, replay, njs, bpm, first_ms, seed, mapper, fmt, title, artist, cover, version, scene, rhythm,
                 song_stars) = rest[:MAX_LEVELS], rest[MAX_LEVELS:]
@@ -601,6 +625,10 @@ def build(ckpt, device):
         with gr.Tabs():
             with gr.Tab("Make a map"):
                 song = gr.Audio(label="Song", type="filepath", format=None, sources=["upload"], elem_id="song")
+                with gr.Row(elem_id="youtube-row"):
+                    youtube_link = gr.Textbox(show_label=False, scale=1, min_width=0, max_lines=1,
+                                              placeholder="…or paste a YouTube link", elem_id="youtube-link")
+                    youtube_go = gr.Button("Get the song", scale=0, min_width=0, elem_id="youtube-go")
                 with gr.Row(visible=False, elem_id="song-details") as names:
                     cover = gr.Image(label="Cover", type="filepath", sources=["upload"],
                                      height=132, width=132, min_width=132, scale=0, show_label=False,
@@ -704,6 +732,8 @@ def build(ckpt, device):
             c, a = found_cover(t.strip(), a.strip())
             return c, c, a
 
+        for ev in (youtube_go.click, youtube_link.submit):
+            ev(from_youtube, youtube_link, song, concurrency_limit=1)
         song.change(song_names, [song, version], [names, title, artist, cover, auto_cover, diff, song_stars])
         for box in (title, artist):
             box.blur(renamed, [title, artist, cover, auto_cover], [cover, auto_cover, artist])

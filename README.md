@@ -56,6 +56,8 @@ The 1.0 and 1.1 map models are still in the menu under Expert.
 - covers and artist names found online
 - less repeating, no notes that make the sabers meet head on
 - faster on Linux
+- paste a YouTube link instead of adding a file
+- acc style stays calmer at 8★ and up
 
 **1.1**
 - new map model, better at low and mid stars

@@ -28,8 +28,8 @@ struct Consts {
     slide_ok: Vec<bool>,
     clash: Vec<bool>,
     slide_turn: i64,
-    forehand: u16,
-    backhand: u16,
+    forehand: [u16; 2],
+    backhand: [u16; 2],
     opening: u16,
     down: u16,
     up: u16,
@@ -52,6 +52,10 @@ struct Consts {
     double_from: i64,
     double_push: f64,
     double_max: f64,
+    air_rate: f64,
+    air_from: i64,
+    air_push: f64,
+    air_max: f64,
     hold_from: f64,
     hold_grow: f64,
     hold_max: f64,
@@ -111,8 +115,8 @@ impl NativeConsts {
             slide_ok: get(d, "slide_ok")?,
             clash: get(d, "clash")?,
             slide_turn: get(d, "slide_turn")?,
-            forehand: bits(&get::<Vec<i64>>(d, "forehand")?),
-            backhand: bits(&get::<Vec<i64>>(d, "backhand")?),
+            forehand: get::<Vec<Vec<i64>>>(d, "forehand")?.iter().map(|v| bits(v)).collect::<Vec<_>>().try_into().map_err(|_| PyValueError::new_err("forehand: 2 hands"))?,
+            backhand: get::<Vec<Vec<i64>>>(d, "backhand")?.iter().map(|v| bits(v)).collect::<Vec<_>>().try_into().map_err(|_| PyValueError::new_err("backhand: 2 hands"))?,
             opening: bits(&get::<Vec<i64>>(d, "opening")?),
             down: bits(&get::<Vec<i64>>(d, "down")?),
             up: bits(&get::<Vec<i64>>(d, "up")?),
@@ -135,6 +139,10 @@ impl NativeConsts {
             double_from: get(d, "double_from")?,
             double_push: get(d, "double_push")?,
             double_max: get(d, "double_max")?,
+            air_rate: get(d, "air_rate")?,
+            air_from: get(d, "air_from")?,
+            air_push: get(d, "air_push")?,
+            air_max: get(d, "air_max")?,
             hold_from: get(d, "hold_from")?,
             hold_grow: get(d, "hold_grow")?,
             hold_max: get(d, "hold_max")?,
@@ -305,6 +313,8 @@ struct State {
     cols: [Option<(i64, u8)>; 2],
     moments_n: i64,
     doubles_n: i64,
+    swings_n: i64,
+    air_free_n: i64,
     head: [Option<i64>; 2],
     rest: [Option<i64>; 2],
     owe: [bool; 2],
@@ -378,6 +388,8 @@ impl State {
     }
 
     fn swung(&mut self, h: usize, air: bool) {
+        self.swings_n += 1;
+        self.air_free_n += (air && !self.owe[h] && (self.times.is_none() || self.in_times(self.tick))) as i64;
         self.rest[h] = if air { self.rest[h].map(|r| 2 - r) } else { None };
         self.owe[h] = false;
     }
@@ -643,7 +655,7 @@ impl State {
             return ok;
         }
         if let Some(h) = self.need_note {
-            let mut dirs = if self.face[h] == Some(true) { c.forehand } else { c.backhand };
+            let mut dirs = if self.face[h] == Some(true) { c.forehand[h] } else { c.backhand[h] };
             if !self.opened[h] {
                 dirs &= c.opening;
             }
@@ -757,7 +769,7 @@ impl State {
                 let (cells, dirs) = self.slide(
                     h,
                     self.line(h, self.sides(h, note_free, false)),
-                    self.fit(h, if f { c.forehand } else { c.backhand }),
+                    self.fit(h, if f { c.forehand[h] } else { c.backhand[h] }),
                 );
                 self.put(&mut ok, h, cells, dirs, false);
             }
@@ -848,11 +860,39 @@ impl State {
         out
     }
 
+    fn air_penalty(&self) -> Vec<(usize, f64)> {
+        let c = &self.c;
+        if self.swings_n < c.air_from
+            || self.need_note.is_some()
+            || self.need_time
+            || self.objects_now
+            || self.tick.is_none()
+            || (self.times.is_some() && !self.in_times(self.tick))
+        {
+            return Vec::new();
+        }
+        let over = self.air_free_n as f64 / self.swings_n as f64 - c.air_rate;
+        if over <= 0.0 {
+            return Vec::new();
+        }
+        let amount = (c.air_push * over / 0.01).min(c.air_max);
+        let mut out = Vec::new();
+        for h in 0..2 {
+            if !self.owe[h] {
+                for f in [false, true] {
+                    out.push((self.swing(h, f, true), amount));
+                }
+            }
+        }
+        out
+    }
+
     fn penalties(&mut self) -> Vec<(usize, f64)> {
         let mut out = self.loop_penalty();
         out.extend(self.turn_penalty());
         out.extend(self.hold_penalty());
         out.extend(self.double_penalty());
+        out.extend(self.air_penalty());
         out
     }
 
@@ -1014,6 +1054,8 @@ impl Rules {
             cols: [None, None],
             moments_n: 0,
             doubles_n: 0,
+            swings_n: 0,
+            air_free_n: 0,
             head: [None, None],
             rest: [None, None],
             owe: [false, false],
