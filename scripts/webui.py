@@ -73,6 +73,7 @@ CSS = f"""
 #title h1 .r {{ color: {RED}; }}
 #title h1 .b {{ color: {BLUE}; }}
 #title p {{ opacity: .6; margin: 6px 0 0; }}
+#no-gpu {{ color: {RED}; text-align: center; padding: 8px 0; }}
 #go, #play {{ background: linear-gradient(90deg, {RED}, {BLUE}); border: none; color: white; font-weight: 700; }}
 footer {{ display: none !important; }}
 #map-zip {{ border-style: solid !important; }}
@@ -246,6 +247,8 @@ class Status:
             elif line.startswith("scene:"):
                 env = line.split(":", 1)[1].strip()
                 self.scene = next((name for name, e in SCENES.items() if e == env), env).replace(" (default)", "")
+            elif line == "making the lights":
+                self.phase = "Making the lights"
             elif line.startswith("song:"):
                 self.phase = "Making the map"
                 self.song = float(line.split()[1])
@@ -310,7 +313,7 @@ class Status:
         elif done:
             head = f"<span>Done in {took:.0f} s</span>"
         else:
-            left = self.left()
+            left = None if self.phase == "Making the lights" else self.left()
             left = f" · about {left:.0f} s left" if left is not None else ""
             head = f"<span>{self.phase}…</span><span>{took:.0f} s{left}</span>"
         busy = not done and not error and not any(d for d, _ in self.beats.values())
@@ -397,6 +400,10 @@ def prefetch(device):
         except Exception as e:
             print(f"prefetch: {e}", flush=True)
     print("models ready", flush=True)
+
+
+NO_GPU = ("No GPU here, so maps take many minutes and land less close to the stars asked. "
+          "On Colab: Runtime → Change runtime type → T4 GPU, then run both cells again.")
 
 
 def show_link(local, public):
@@ -622,6 +629,8 @@ def build(ckpt, device):
     with gr.Blocks(title="bsgen", analytics_enabled=False) as demo:
         gr.HTML('<div id="title"><h1><span class="r">bs</span><span class="b">gen</span></h1>'
                 "<p>Beat Saber maps from any song</p></div>")
+        if str(device) == "cpu":
+            gr.HTML(f'<div id="no-gpu">{NO_GPU}</div>')
         with gr.Tabs():
             with gr.Tab("Make a map"):
                 song = gr.Audio(label="Song", type="filepath", format=None, sources=["upload"], elem_id="song")
@@ -764,6 +773,8 @@ def main():
     theme = gr.themes.Base(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.red,
                            neutral_hue=gr.themes.colors.zinc, radius_size=gr.themes.sizes.radius_md,
                            font=[gr.themes.GoogleFont("Inter"), "system-ui", "sans-serif"])
+    if str(args.device) == "cpu":
+        print(NO_GPU, flush=True)
     demo = build(args.ckpt, args.device)
     share = args.share or "COLAB_RELEASE_TAG" in os.environ
     said = io.StringIO()

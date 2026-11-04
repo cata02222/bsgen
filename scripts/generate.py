@@ -129,9 +129,10 @@ def parser():
     ap.add_argument("--rhythm-audio-cfg", type=float, default=None,
                     help="the rhythm model's push toward the music over its own last beats (0: none; default "
                          "by the stars, rhythm.AUDIO_CFG)")
-    ap.add_argument("--star-tries", type=int, default=STAR_TRIES,
+    ap.add_argument("--star-tries", type=int, default=None,
                     help="maps made at once per difficulty, each asked for more or fewer stars, to land on the "
-                         "stars asked: the one rated nearest them is kept (1: one map, made at the stars asked)")
+                         f"stars asked: the one rated nearest them is kept (1: one map, made at the stars asked; "
+                         f"default: {STAR_TRIES} on a GPU, 1 without one, where each map takes minutes)")
     ap.add_argument("--star-climb", type=float, default=STAR_CLIMB,
                     help="the most stars above the stars asked a try may be made at (default %(default)s)")
     ap.add_argument("--rhythm-tries", type=int, default=RHYTHM_TRIES,
@@ -466,7 +467,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
     if parallel is None:
         free = torch.cuda.mem_get_info()[0] / 1e9 if str(args.device).startswith("cuda") else len(stars)
         parallel = int(free // GB_PER_DIFFICULTY)
-    k = max(1, args.star_tries) if rating.available() else 1
+    tries = args.star_tries if args.star_tries is not None else STAR_TRIES if str(args.device).startswith("cuda") else 1
+    k = max(1, tries) if rating.available() else 1
     workers = max(1, min(parallel, len(stars) * k))
     with ThreadPoolExecutor(workers) as ex, sample.together(workers):
         made = [[] for _ in stars]
@@ -478,8 +480,17 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 break
             quiet = (lambda m: None) if k > 1 and not args.verbose else None
             times = rhythms([(a, njs[i], stars[i]) for i, _, a in todo])
+            beats = {}
+
+            def tick(i, j):
+                def on_beat(name, beat, total):
+                    beats[i, j] = beat
+                    n = len(asks[i])
+                    progress(name, sum(beats.get((i, x), 0) for x in range(n)), total * n)
+                return on_beat if progress else None
+
             for (i, _, _), lv in zip(todo, ex.map(lambda t, h: level(stars[t[0]], names[t[0]], njs[t[0]], t[2], h,
-                                                                     progress if t[1] == 0 else None,
+                                                                     tick(t[0], t[1]),
                                                                      None if t[1] == 0 else quiet), todo, times)):
                 made[i].append(lv)
             asks = [next_asks(s, m, k, args.star_climb) for s, m in zip(stars, made)]
@@ -494,6 +505,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             if len(m) > 1:
                 log(f"{lv['difficulty']}: kept the one made at {lv['ask']:g}★, rated {lv['est']:.1f}★ of {s:g} asked"
                     f" ({len(m)} made: " + ", ".join(f"{x['ask']:g}→{x['est']}" for x in m) + ")")
+        if not args.no_lights:
+            log("making the lights")
         levels = list(ex.map(finish, levels))
     tag = ",".join(f"{x:g}" for x in stars)
     tag += "star"

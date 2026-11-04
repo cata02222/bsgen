@@ -1,5 +1,10 @@
 # Changelog
 
+**1.2.4** (2026-11-03)
+- no GPU: makes one try instead of three, so maps come much sooner but can land further under the stars asked
+- the bar keeps moving through every try and Stop works the whole way
+- says when there's no GPU, and shows when it's making the lights
+
 **1.2.3** (2026-11-03)
 - no more second cut the same way right behind the first
 - resets with room get a bomb where the hand would be
