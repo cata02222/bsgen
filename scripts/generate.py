@@ -414,6 +414,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         notes, bombs, walls = (x[x["beat"] <= end_beat] for x in (notes, bombs, walls))
         walls["duration"] = np.minimum(walls["duration"], end_beat - walls["beat"])
         arcs = arcs[arcs["tail_beat"] <= end_beat]
+        if not args.no_bombs:
+            bombs = sample.reset_bombs(notes, bombs, walls, tempo.to_seconds)
         if late:
             say(f"{late} notes in the song's quiet ending left out")
         secs = tempo.to_seconds(notes["beat"])

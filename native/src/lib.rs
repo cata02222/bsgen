@@ -304,6 +304,7 @@ struct State {
     double_gap: i64,
     double: Option<i64>,
     swing_gap: i64,
+    slide_gap: i64,
     uncross: bool,
     cell_gap: i64,
     cell_tick: [Option<i64>; 12],
@@ -772,7 +773,11 @@ impl State {
             {
                 ok[self.swing(h, !f, true)] = true;
             }
+            let late_slide = self.slide_gap != 0
+                && self.stack[h] == 0
+                && self.prev_moment[h].is_some_and(|p| tick - p > self.slide_gap);
             if !self.air[h]
+                && !late_slide
                 && let Some(f) = self.face[h]
             {
                 let (cells, dirs) = self.slide(
@@ -1011,7 +1016,7 @@ impl Rules {
     #[new]
     #[pyo3(signature = (consts, tick, kind, hand, forehand, air, cell, dir, shape, dur, end_tick, swings, objects,
                         max_loop, behind, dry, turn, copy, hold, times, double_gap, cell_gap, swing_gap, uncross, near_gap,
-                        wall_gap, vision_gap))]
+                        wall_gap, vision_gap, slide_gap))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         consts: &NativeConsts,
@@ -1041,6 +1046,7 @@ impl Rules {
         near_gap: i64,
         wall_gap: i64,
         vision_gap: i64,
+        slide_gap: i64,
     ) -> PyResult<Self> {
         let c = consts.c.clone();
         let mut s = State {
@@ -1055,6 +1061,7 @@ impl Rules {
             double_gap,
             double: None,
             swing_gap,
+            slide_gap,
             uncross,
             cell_gap,
             cell_tick: [None; 12],

@@ -20,6 +20,14 @@ BACKHAND_DIRS = {0: {0, 4, 5, 2, 8}, 1: {0, 4, 5, 3, 8}}
 OPENING_DIRS = {1, 6, 7, 8}
 DIR_ANGLE = {0: 180, 1: 0, 2: 270, 3: 90, 4: 225, 5: 135, 6: 315, 7: 45}
 SLIDE_TURN = 45
+SLIDE_GAP_S = 0.05
+
+
+def slide_gap_ticks(beat_times):
+    spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
+    return max(1, int(SLIDE_GAP_S / spb * TICKS))
+
+
 SWING_GAP = TICKS // 4
 SWING_GAP_STARS, SWING_GAP_MS = [8, 12], [85, 60]
 
@@ -290,7 +298,8 @@ class Rules:
 
     def __init__(self, prefix_events, end_tick, swings=True, objects=OBJ_WALLS | OBJ_BOMBS | OBJ_ARCS,
                  max_loop=MAX_LOOP, behind=TICKS // 2, dry=0.0, turn=0.0, copy=None, hold=0.0, times=None,
-                 double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0, vision_gap=0):
+                 double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0, vision_gap=0,
+                 slide_gap=0):
         self.end, self.swings, self.objects, self.turn, self.hold = end_tick, swings, objects, turn, hold
         self.times = None if times is None else np.asarray(times, np.int64)
         self.time_set = set() if times is None else set(self.times.tolist())
@@ -298,6 +307,7 @@ class Rules:
         self.wall_gap = wall_gap
         self.double_gap, self.double = double_gap, None
         self.swing_gap = swing_gap
+        self.slide_gap = slide_gap
         self.uncross = uncross
         self.cell_gap, self.cell_tick = cell_gap, {}
         self.bomb_tick = {}
@@ -673,7 +683,9 @@ class Rules:
                     ok[VOCAB.swing(h, 1 - f if self.late(h) else f, 0)] = True
             elif self.swing_tick[h] != self.tick and self.face[h] is not None:
                 ok[VOCAB.swing(h, int(not self.face[h]), 1)] = True
-            if not self.air[h] and self.face[h] is not None:
+            late_slide = (self.slide_gap and not self.stack[h] and self.prev_moment[h] is not None
+                          and self.tick - self.prev_moment[h] > self.slide_gap)
+            if not self.air[h] and self.face[h] is not None and not late_slide:
                 self._put(ok, h, *self.slide(h, self._line(h, self._sides(h, note_free, first=False)),
                                              self.fit(h, (FOREHAND_DIRS if self.face[h] else BACKHAND_DIRS)[h])))
         return ok
@@ -769,13 +781,14 @@ def native_consts():
 
 
 def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry, turn, copy, hold, times,
-                 double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap):
+                 double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap=0):
     e = prefix_events
     return NATIVE.Rules(native_consts(), e["tick"], e["kind"], e["hand"], e["forehand"], e["air"], e["cell"],
                         e["dir"], e["shape"], e["dur"], int(end_tick), bool(swings), int(objects), int(max_loop),
                         int(behind), float(dry), float(turn), None if copy is None else (int(copy[0]), int(copy[1])),
                         float(hold), None if times is None else [int(t) for t in times], int(double_gap),
-                        int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap), int(vision_gap))
+                        int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap), int(vision_gap),
+                        int(slide_gap))
 
 
 GRAPHS = True
@@ -1157,6 +1170,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     vision_gap = vision_gap_ticks(beat_times)
     wall_gap = wall_switch_ticks(beat_times)
     swing_gap = swing_gap_ticks(beat_times, stars)
+    slide_gap = slide_gap_ticks(beat_times)
     uncross = stars is not None and stars < UNCROSS_STARS
     swings = getattr(model, "swings", True)
     last_note = 0
@@ -1200,7 +1214,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             rules = []
             for _ in range(candidates):
                 r = make_rules(ev, end, swings, allow, max_loop, behind, dry, turn_now, copy, hold, times,
-                               double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap)
+                               double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap)
                 r.begin(t0, new0 - 1)
                 rules.append(r)
             boost = arc_boost
@@ -1408,3 +1422,71 @@ def pick_candidate(counts, spread=1.25):
         if med / spread <= c <= med * spread or abs(c - med) <= 2:
             return i
     return int(np.argmin(np.abs(counts - med)))
+
+
+RESET_BOMB_BEATS, RESET_BOMB_S, RESET_BOMB_MAX_S = 1.0, 0.3, 3.0
+RESET_SAME_SWING_S = 0.07
+RESET_OTHER_S = 0.2
+
+
+def reset_bombs(notes, bombs, walls, to_seconds, cell_gap_beats=CELL_GAP_BEATS):
+    from .beatmap import BOMB_DTYPE
+    notes = np.sort(notes, order="beat")
+    secs = to_seconds(notes["beat"])
+    new = []
+    for h in (0, 1):
+        idx = np.where(notes["color"] == h)[0]
+        face = last = None
+        for i in idx:
+            d = int(notes["cut_dir"][i])
+            if last is not None and secs[i] - secs[last] < RESET_SAME_SWING_S:
+                last = i
+                continue
+            f = None if d >= 8 else d in FOREHAND_DIRS[h]
+            if last is not None and f is not None and f == face and int(notes["cut_dir"][last]) < 8:
+                spot = _reset_spot(notes, secs, bombs, walls, new, to_seconds, last, i, h, cell_gap_beats)
+                if spot:
+                    new.append(spot)
+            face = f if f is not None else (None if face is None else not face)
+            last = i
+    if not new:
+        return bombs
+    add = np.zeros(len(new), BOMB_DTYPE)
+    add["beat"], add["line"], add["layer"] = zip(*new)
+    add["time"] = to_seconds(add["beat"])
+    out = np.concatenate([bombs, add])
+    return out[np.argsort(out["beat"], kind="stable")]
+
+
+def _reset_spot(notes, secs, bombs, walls, new, to_seconds, p, n, h, cell_gap_beats):
+    b0, b1 = float(notes["beat"][p]), float(notes["beat"][n])
+    gap, gap_s = b1 - b0, float(secs[n] - secs[p])
+    if gap < RESET_BOMB_BEATS or not RESET_BOMB_S <= gap_s <= RESET_BOMB_MAX_S:
+        return None
+    d = int(notes["cut_dir"][p])
+    row = 2 if d in UP_DIRS else 0
+    line = int(notes["line"][p])
+    held = [(b, x, y) for b, x, y in zip(bombs["beat"], bombs["line"], bombs["layer"]) if b0 < b < b1] \
+        + [s for s in new if b0 < s[0] < b1]
+    if any(abs(int(x) - line) <= 1 and int(y) == row for _, x, y in held):
+        return None
+    beat = round((b0 + gap * (2 / 3 if gap < 2 else 0.5)) * TICKS) / TICKS
+    t = float(to_seconds(np.array([beat]))[0])
+    other_col = int(notes["line"][n])
+    for col in dict.fromkeys((line, other_col, line + (1 if h == 0 else -1))):
+        if 0 <= col <= 3 and _bomb_fits(notes, secs, walls, beat, t, col, row, h, cell_gap_beats):
+            return beat, col, row
+    return None
+
+
+def _bomb_fits(notes, secs, walls, beat, t, col, row, h, cell_gap_beats):
+    in_col = notes["line"] == col
+    if np.any(in_col & (notes["layer"] == row) & (np.abs(notes["beat"] - beat) < cell_gap_beats)):
+        return False
+    if np.any(in_col & (notes["color"] == 1 - h) & (np.abs(secs - t) < RESET_OTHER_S)):
+        return False
+    for w in walls:
+        if w["beat"] - cell_gap_beats <= beat <= w["beat"] + w["duration"] + cell_gap_beats \
+                and w["line"] <= col < w["line"] + w["width"]:
+            return False
+    return True

@@ -1,5 +1,9 @@
 # Changelog
 
+**1.2.3** (2026-11-03)
+- no more second cut the same way right behind the first
+- resets with room get a bomb where the hand would be
+
 **1.2.2** (2026-11-03)
 - harder difficulties rate higher than easier ones
 
