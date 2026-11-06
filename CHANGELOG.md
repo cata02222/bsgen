@@ -1,5 +1,12 @@
 # Changelog
 
+**1.3** (2026-11-06)
+- new map model, far fewer odd resets
+- new rhythm model
+- lights follow the song more, calmer when it's loud
+- no more bomb walls
+- replays: cleaner swings, fewer bad cuts
+
 **1.2.4** (2026-11-03)
 - no GPU: makes one try instead of three, so maps come much sooner but can land further under the stars asked
 - the bar keeps moving through every try and Stop works the whole way

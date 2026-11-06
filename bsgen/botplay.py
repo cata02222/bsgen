@@ -24,7 +24,7 @@ def load_player(path, dev="cuda"):
     return model.eval()
 
 
-def swing_plan(notes, dev="cuda"):
+def swing_plan(notes, dev="cuda", bombs=None):
     if not len(notes):
         return np.zeros(0, np.int8)
     if dev not in _labeler:
@@ -39,7 +39,7 @@ def swing_plan(notes, dev="cuda"):
         _labeler[dev] = m
     o = labeler.order(notes)
     plan = np.full(len(notes), UNKNOWN, np.int8)
-    plan[o] = labeler.label(_labeler[dev], notes[o], dev, quick_reset=labeler.QUICK_RESET_S) + 1
+    plan[o] = labeler.label(_labeler[dev], notes[o], dev, quick_reset=labeler.QUICK_RESET_S, bombs=bombs) + 1
     return plan
 
 
@@ -50,7 +50,7 @@ def map_objects(zip_path, difficulty, characteristic="Standard", plan=False, dev
     n_beats = int(max([d.notes["beat"].max() if len(d.notes) else 0] +
                       [(d.walls["beat"] + d.walls["duration"]).max() if len(d.walls) else 0])) + 4
     beat_times = d.tempo.to_seconds(np.arange(n_beats, dtype=float)) + info.song_offset
-    plan = swing_plan(d.notes, dev) if plan else None
+    plan = swing_plan(d.notes, dev, d.bombs) if plan else None
     return objects_from_map(d.notes, d.bombs, d.walls, beat_times, plan), d.njs or 18.0, info
 
 
@@ -150,11 +150,70 @@ def touch_up(motion, objects, njs):
     return motion, saved
 
 
+CLEAR_SHIFTS = (0.02, -0.02, 0.04, -0.04, 0.06, -0.06)
+CLEAR_MOVES = (0.05, 0.1, 0.15)
+
+
+def clear_crossings(motion, objects, njs):
+    notes = judge.Notes(objects, njs)
+    good, bad, bad_saber, _ = judge.replay_hits(notes, motion)
+    motion = motion.copy()
+    saved = 0
+    for k in np.flatnonzero((bad >= 0) & ((good < 0) | (bad < good)) & (bad_saber >= 0) & (bad_saber != notes.color)):
+        f = int(round(notes.time[k] * HZ))
+        a, b = f - TOUCH_BEFORE, f + TOUCH_AFTER
+        if a < 9 or b + 9 > len(motion):
+            continue
+        lo, hi = a - 8, b + 8
+        ids, before = _outcomes(notes, motion, lo, hi)
+        want = before.copy()
+        want[ids == k] = 1
+        w = _bump(b - a, TOUCH_BEFORE)
+        own, other = 9 * (1 + int(notes.color[k])), 9 * (1 + int(bad_saber[k]))
+        tries = []
+
+        def shifted(h, dt, w=w):
+            src = np.arange(a, b) - dt * HZ * w
+            j = np.clip(src.astype(int), 0, len(motion) - 2)
+            u = (src - j)[:, None]
+            return h, (1 - u) * motion[j, h:h + 9] + u * motion[j + 1, h:h + 9]
+
+        tries += [shifted(other, dt) for dt in CLEAR_SHIFTS]
+        tries += [shifted(own, dt) for dt in TOUCH_SHIFTS if dt < 0]
+        fb = int(np.clip(bad[k] - a, 0, b - a - 1))
+        hilt, blade = judge.tips(motion[a + fb:a + fb + 1].astype(np.float32))
+        o = int(bad_saber[k])
+        pts = hilt[0, o] + blade[0, o] * judge.BLADE_POINTS[:, None]
+        depth = (notes.time[k] - (a + fb) / HZ) * notes.njs + judge.NOTE_DEPTH
+        centre = np.r_[notes.centre[k], depth]
+        loc = judge._local(pts, centre, notes.across[k], notes.along[k])
+        side = loc[np.argmin(np.linalg.norm(loc, axis=-1)), :2]
+        if np.linalg.norm(side) > 1e-3:
+            side = side / np.linalg.norm(side)
+            way = side[0] * notes.across[k] + side[1] * notes.along[k]
+            for d in CLEAR_MOVES:
+                t = motion[a:b, other:other + 9].copy()
+                t[:, :3] += _bump(b - a, fb)[:, None] * way * d
+                tries.append((other, t))
+        for h, t in tries:
+            trial = motion[lo:hi].copy()
+            trial[a - lo:b - lo, h:h + 9] = orthonormal(np.tile(t, 3))[:, h:h + 9]
+            test = motion.copy()
+            test[lo:hi] = trial
+            ids2, after = _outcomes(notes, test, lo, hi)
+            if np.array_equal(ids2, ids) and np.array_equal(after, want):
+                motion[lo:hi] = trial
+                saved += 1
+                break
+    return motion, saved
+
+
 def play_motion(model, zip_path, difficulty, seed=0, candidates=4, steps=12, height=1.7, progress=None, dev="cuda"):
     objects, njs, _ = map_objects(zip_path, difficulty, plan=model.config.get("plan", False), dev=dev)
     motion, t0 = play(model, objects, height, njs, steps=steps, seed=seed, dev=dev, candidates=candidates,
                       progress=progress)
-    return touch_up(from_song_start(motion, t0), objects, njs)[0]
+    motion = touch_up(from_song_start(motion, t0), objects, njs)[0]
+    return clear_crossings(motion, objects, njs)[0]
 
 
 def save_replay(zip_path, difficulty, motion, out):

@@ -38,10 +38,11 @@ def main():
                       warmup=args.warmup, recenter=args.recenter, candidates=args.candidates,
                       accuracy=args.accuracy, turns=not args.free_turns)
     motion, saved = botplay.touch_up(botplay.from_song_start(motion, t0), objects, njs)
+    motion, cleared = botplay.clear_crossings(motion, objects, njs)
     np.savez(out.with_name(out.name + ".npz"), motion=motion, t0=0.0)
     events = botplay.write_replay(out.with_name(out.name + ".bsor"), args.map, args.diff, motion, info, njs, objects)
     s = botplay.summary(events)
-    print(f"{len(motion) / 60:.0f} s of motion: {botplay.describe(s)} ({saved} near misses touched up) -> {out}.bsor")
+    print(f"{len(motion) / 60:.0f} s of motion: {botplay.describe(s)} ({saved} near misses touched up, {cleared} crossings cleared) -> {out}.bsor")
 
 
 if __name__ == "__main__":

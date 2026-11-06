@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import pattern as pattern_levels
 from . import tokens
 from .tokens import CONTEXT, COND_FIELDS, MAX_MAPPERS, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, TICKS, VOCAB, WINDOW
 

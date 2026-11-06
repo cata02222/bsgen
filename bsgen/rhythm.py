@@ -25,8 +25,10 @@ USUAL_RATINGS = [(2, 0.70, 0.57), (3, 1.46, 1.25), (4, 2.23, 2.01), (5, 2.90, 2.
                  (14, 9.04, 10.86), (15, 10.40, 13.72)]
 TRIES, TRIES_CHUNK = 64, 16
 GAP_ACT, GAP_BEATS = 0.5, 32
+FINE_MAX = 8.0
 EVEN_STARS, EVEN_MIN = [2, 5.5, 8, 10, 12, 14.5], [0.65, 0.60, 0.58, 0.53, 0.54, 0.47]
 REPEAT_STARS, REPEAT_MAX, REPEAT_BARS = [3.5, 7.5, 10.5, 14], [0.73, 0.80, 0.83, 0.90], 55
+OFF_STARS, OFF_WEIGHTS, ACCENT_S = [9, 11], [4.0, 2.0], 0.03
 MAX_BEATS = 1536
 
 
@@ -249,6 +251,7 @@ def load(path, dev="cuda"):
     model.load_state_dict(ck["model"])
     model.vocab = Vocab(ck["patterns"])
     model.usual = ck.get("usual")
+    model.temp_add = float(ck.get("temp_add", 0.0))
     return model.to(dev).eval()
 
 
@@ -264,7 +267,7 @@ def usual_level(model, stars):
 
 @torch.no_grad()
 def generate(model, logmel, fps, beat_times, offset, n_beats, stars, style=None, temp=1.0, top_p=0.95, cfg=1.0,
-             n=1, level=None, ratings=None, dev="cuda", gen=None, audio_cfg=None):
+             n=1, level=None, ratings=None, dev="cuda", gen=None, audio_cfg=None, check=None):
     rows = np.broadcast_to(np.asarray(stars, np.float64), (n,))
     levels = list(level) if isinstance(level, list) else [level] * n
     if model.config.get("level") and model.usual is not None:
@@ -307,6 +310,8 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, style=None,
         B = mem.shape[0]
         prev = torch.full((B,), vocab.bos, device=dev, dtype=torch.long)
         for t in range(T):
+            if check is not None and t % 16 == 0:
+                check()
             known = start + t < done
             with torch.autocast("cuda", torch.bfloat16, enabled=STEP_BF16):
                 lg = model.step(mem, prev, t, caches, mem_cs).float()
@@ -359,6 +364,11 @@ def drop_outs(ticks, logmel, fps, beat_times, offset, active=0.95, end=None, sta
     return thin, 8 * longest
 
 
+def fine_share(ticks):
+    k = np.asarray(ticks) % TICKS
+    return 100 * float(np.mean((k % 3 == 0) & (k % (TICKS // 4) != 0))) if len(k) else 0.0
+
+
 def evenness(ticks, beat_times, offset):
     sec = np.sort(beat_to_sec(np.unique(np.asarray(ticks)) / TICKS + offset, beat_times))
     if len(sec) < 10:
@@ -404,6 +414,29 @@ def burst(ticks, beat_times, offset):
     return float((np.searchsorted(sec, sec + BURST_SECS, "left") - np.arange(len(sec))).max()) / BURST_SECS
 
 
+def accents(logmel, fps):
+    from scipy.ndimage import maximum_filter1d, uniform_filter1d
+    x = np.maximum(np.asarray(logmel, np.float32), -45.0)
+    rise = uniform_filter1d(np.maximum(np.diff(x, axis=0, prepend=x[:1]), 0).sum(1), max(int(round(0.03 * fps)), 1))
+    span = max(int(round(2 * fps)) | 1, 3)
+    mean = uniform_filter1d(rise, span)
+    std = np.sqrt(np.maximum(uniform_filter1d(rise ** 2, span) - mean ** 2, 1e-9))
+    peak = rise == maximum_filter1d(rise, max(int(round(0.07 * fps)) | 1, 3))
+    return np.flatnonzero(peak & (rise > mean + 0.8 * std) & (rise > 0.12 * np.percentile(rise, 99.5))) / fps
+
+
+def on_accents(ticks, marks, beat_times, offset):
+    return on_sound(beat_to_sec(np.unique(np.asarray(ticks)) / TICKS + offset, beat_times), marks)
+
+
+def on_sound(sec, marks):
+    if not len(sec) or not len(marks):
+        return 0.0
+    j = np.searchsorted(marks, sec)
+    near = np.minimum(np.abs(marks[np.minimum(j, len(marks) - 1)] - sec), np.abs(marks[np.maximum(j - 1, 0)] - sec))
+    return float(np.mean(near <= ACCENT_S))
+
+
 def star_cfg(stars):
     return float(np.interp(stars, CFG_STARS, CFG))
 
@@ -439,7 +472,8 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
     rl = list(ratings) if many and isinstance(ratings, list) else [ratings] * m
     cf = [star_cfg(x) if cfg is None else cfg for x in sl]
     tp = [star_sampling(x) for x in sl]
-    te, pp = [t if temp is None else temp for t, _ in tp], [p if top_p is None else top_p for _, p in tp]
+    hot = getattr(model, "temp_add", 0.0)
+    te, pp = [t + hot if temp is None else temp for t, _ in tp], [p if top_p is None else top_p for _, p in tp]
     style = kw.get("style")
     gens = [[] for _ in sl]
     for k in range(0, tries, TRIES_CHUNK):
@@ -459,13 +493,15 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
     from .sample import song_end, song_start
     start, end = sec_to_beat(np.array([song_start(logmel, fps), song_end(logmel, fps)]), beat_times) - offset
     start, end = max(start, 0.0), min(end, n_beats)
+    marks = accents(logmel, fps)
 
-    def score(t, want):
+    def score(t, want, off):
         thin, drop = drop_outs(t, logmel, fps, beat_times, offset, end=end, start=start)
         if len(t) < 10:
             return 4 * thin + drop / 32
         drop += max(drop_outs(t, logmel, fps, beat_times, offset, GAP_ACT, end=end, start=start)[1] - GAP_BEATS, 0)
         loud = LOUD_WEIGHT * max(loud_corr(t, logmel, fps, beat_times, offset) - LOUD_CORR, 0.0)
+        loud += off * (1 - on_accents(t, marks, beat_times, offset))
         if want is None:
             return 4 * thin + drop / 32 + loud
         span = np.diff(beat_to_sec(np.array([min(t.min() / TICKS, start), max(t.max() / TICKS, end)]) + offset,
@@ -478,6 +514,8 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
         even = [t for t in g if evenness(t, beat_times, offset) >= floor] or g
         top = float(np.interp(x, REPEAT_STARS, REPEAT_MAX))
         varied = [t for t in even if bar_repeat(t) <= top] or even
+        fine = [fine_share(t) for t in varied]
+        varied = [t for t, f in zip(varied, fine) if f <= FINE_MAX] or [varied[int(np.argmin(fine))]]
         cap, peak_cap = SPIKE_MAX.get(style, SPIKE_DEFAULT), PEAK_MAX.get(style, np.inf)
         spikes = [spike(t, beat_times, offset) for t in varied]
         calm = [t for t, (r, p) in zip(varied, spikes) if r <= cap and p <= peak_cap]
@@ -486,7 +524,8 @@ def best_of(model, logmel, fps, beat_times, offset, n_beats, stars, tries=TRIES,
         most = float(np.interp(aim, BURST_STARS, BURST_MAX))
         rates = [burst(t, beat_times, offset) for t in calm]
         calm = [t for t, r in zip(calm, rates) if r <= most] or [calm[int(np.argmin(rates))]]
-        picks.append(min(calm, key=lambda t: score(t, want)))
+        off = float(np.interp(x, OFF_STARS, OFF_WEIGHTS))
+        picks.append(min(calm, key=lambda t: score(t, want, off)))
     return picks if many else picks[0]
 
 

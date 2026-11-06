@@ -108,13 +108,14 @@ def label(model, notes, dev="cuda", quick_reset=0.0, bombs=None):
     rule = parity_rule(notes)
     dots = (notes["cut_dir"] == 8) & (lab != JOIN) & (rule != JOIN)
     lab[dots] = rule[dots]
-    return _slow_resets(notes, lab, logits, quick_reset) if quick_reset else lab
+    return _slow_resets(notes, lab, logits, quick_reset, bombs) if quick_reset else lab
 
 
-QUICK_RESET_S, QUICK_RESET_COST = 0.15, 4.0
+QUICK_RESET_S, QUICK_RESET_COST = 0.5, 4.0
 
 
-def _slow_resets(notes, lab, logits, quick_reset):
+def _slow_resets(notes, lab, logits, quick_reset, bombs=None):
+    bt = np.sort(bombs["time"]) if bombs is not None and len(bombs) else np.zeros(0)
     lab = lab.copy()
     for h in (0, 1):
         idx = np.flatnonzero(notes["color"] == h)
@@ -124,6 +125,8 @@ def _slow_resets(notes, lab, logits, quick_reset):
         first = idx[starts]
         last = idx[[s - 1 for s in starts[1:]] + [len(idx) - 1]]
         gap = notes["time"][first[1:]] - notes["time"][last[:-1]]
+        bomb = np.searchsorted(bt, notes["time"][first[1:]]) > np.searchsorted(bt, notes["time"][last[:-1]], "right")
+        gap[bomb] = np.inf
         lg = logits[first][:, [NEW_FORE, NEW_BACK]]
         given = (lab[first] == NEW_BACK).astype(int)
         cost = np.maximum(lg[np.arange(len(first)), given][:, None] - lg, 0.0)

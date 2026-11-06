@@ -374,7 +374,7 @@ def star_labels(n, *values):
 
 
 def diff_choices(by_name, version):
-    if version.split()[0] in hub.LEGACY:
+    if version.split()[0] in hub.FIXED_STARS:
         return [(f"{d} · {x:g}★", d) for d, (x, _) in DIFFS.items()]
     if by_name:
         return [(f"{d} · {by_name[name]:g}★", d) for d, (_, name) in DIFFS.items()]
@@ -522,7 +522,7 @@ def build(ckpt, device):
         if mode == "Stars":
             levels = [(x, None) for x in sorted(set(stars[:count]))]
         else:
-            legacy = version.split()[0] in hub.LEGACY and not ckpt
+            legacy = version.split()[0] in hub.FIXED_STARS and not ckpt
             levels = [(x if legacy else (song_stars or {}).get(name, x), name) for d, (x, name) in DIFFS.items() if d in diff]
             if not levels:
                 raise gr.Error("Pick at least one difficulty.")
@@ -573,10 +573,18 @@ def build(ckpt, device):
         if padded:
             q.put(("log", f"the song starts right away: {LEAD_IN:g} s of silence put in front"))
 
-        def progress(name, done, total):
+        def check():
             if stopping.is_set():
                 raise Stopped()
+
+        def progress(name, done, total):
+            check()
             q.put(("beat", name, done, total))
+        progress.check = check
+
+        def log(m):
+            check()
+            q.put(("log", m))
 
         def work():
             try:
@@ -593,7 +601,7 @@ def build(ckpt, device):
                     if "Lights" in extras and state.get("lighter") is None and version not in hub.LEGACY:
                         state["lighter"] = lightmodel.load(hub.light_model(), device)
                     q.put(("phase", "Reading the song"))
-                    result["zip"] = generate.run(args, state["model"], log=lambda m: q.put(("log", m)),
+                    result["zip"] = generate.run(args, state["model"], log=log,
                                                  progress=progress,
                                                  player=state.get("player"), lighter=state.get("lighter"))
             except Stopped:

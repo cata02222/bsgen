@@ -304,6 +304,41 @@ def limit_turns(fut, prev, cap):
     return out
 
 
+OFF_CUT = 70.0
+_ARROW = np.array([(0, 1), (0, -1), (-1, 0), (1, 0), (-1, 1), (1, 1), (-1, -1), (1, -1)], np.float32)
+_ARROW /= np.linalg.norm(_ARROW, axis=1, keepdims=True)
+
+
+MORE_ROUNDS = 4
+
+
+def off_cuts(cands, past, objects, t):
+    n = objects[(objects["kind"] <= BLUE) & (objects["time"] >= t) & (objects["time"] < t + F / HZ)]
+    if not len(n):
+        return np.zeros(len(cands), int)
+    full = np.concatenate([np.repeat(np.asarray(past)[-3:][None], len(cands), 0), cands], 1)
+    out = np.zeros(len(cands), int)
+    for r in n:
+        f = 3 + int(round((float(r["time"]) - t) * HZ))
+        if f + 2 >= full.shape[1]:
+            continue
+        c = 9 * (1 + int(r["kind"]))
+        seg = full[:, [f - 2, f + 2], c:c + 9]
+        a, b = seg[..., 3:6], seg[..., 6:9]
+        tip = seg[..., :3] + np.cross(a, b)
+        v = (tip[:, 1, :2] - tip[:, 0, :2])
+        sp = np.linalg.norm(v, axis=1) + 1e-6
+        d = int(r["dir"])
+        if d < 8:
+            off = np.degrees(np.arccos(np.clip(v @ _ARROW[d] / sp, -1, 1))) > OFF_CUT
+        elif r["plan"] in (NEW_FORE, NEW_BACK):
+            off = (v[:, 1] > 0) == (r["plan"] == NEW_FORE)
+        else:
+            continue
+        out += off & (sp * HZ / 4 > 3.0)
+    return out
+
+
 def turn_caps(objects, t):
     ft = t + np.arange(F) / HZ
     caps = []
@@ -349,9 +384,16 @@ def play(model, objects, height=1.7, njs=18.0, start_pose=None, steps=12, seed=0
         if candidates > 1:
             fut = draw(noise[:1])
             judge.score(fut, t, past)
-            if not judge.clean(0, t - 0.3, t + F / HZ - 0.2):
+            if not judge.clean(0, t - 0.3, t + F / HZ - 0.2) or off_cuts(fut, past, objects, t)[0]:
                 fut = np.concatenate([fut, draw(noise[1:])])
-                best = int(np.argmax(judge.score(fut, t, past)))
+                while True:
+                    sc = judge.score(fut, t, past)
+                    top = np.flatnonzero(sc >= sc.max() - 1e-6)
+                    best = int(top[np.argmin(off_cuts(fut[top], past, objects, t))])
+                    if len(fut) >= candidates * MORE_ROUNDS or judge.clean(best, t - 0.3, t + F / HZ - 0.2):
+                        break
+                    more = torch.randn(candidates, F, DIM, device=dev, generator=g)
+                    fut = np.concatenate([fut, draw(more)])
             else:
                 best = 0
             judge.keep(best)

@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bsgen import artwork, beatmap, botplay, export, hub, lightmodel, lights, rating, rhythm, sample, songstars, timing, tokens
+from bsgen import artwork, beatmap, botplay, export, hub, lightmodel, lights, pattern, rating, rhythm, sample, songstars, timing, tokens
 from bsgen.tokens import SWING
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +27,12 @@ STAR_MAX = 16.0
 STAR_CLIMB = 2.5
 RHYTHM_TRIES = 16
 RHYTHM_BATCH = 3
+STYLE_AIM = True
 
 
-def first_asks(star, k):
+def first_asks(star, k, around=False):
+    if around and k > 1:
+        return [max(star + PLAN_SPREAD * (2 * j / (k - 1) - 1), 0.5) for j in range(k)]
     return [star] if k == 1 else [min(star + STAR_SPREAD * j / (k - 1), STAR_MAX) for j in range(k)]
 
 
@@ -48,10 +51,14 @@ def next_asks(star, made, k, climb=STAR_CLIMB):
 
 
 STAR_ORDER_GAP = 0.5
+PICK_OFF = 10.0
+PLAN_LIFT = 2.5
+PLAN_SPREAD = 0.8
+RHYTHM_AT_WANTED = False
 
 
 def pick_levels(stars, made):
-    near = lambda s, lv: abs(lv["est"] - s) if lv["est"] else 0.0
+    near = lambda s, lv: abs(lv["est"] - s) + PICK_OFF * (1 - lv.get("on", 1.0)) if lv["est"] else 0.0
     nearest = [min(m, key=lambda lv: near(s, lv)) for s, m in zip(stars, made)]
     if any(lv["est"] is None for m in made for lv in m):
         return nearest, True
@@ -115,7 +122,7 @@ def parser():
     ap.add_argument("--rhythm", nargs="?", const="on", default=None,
                     help="a rhythm model writes the whole song's hit times first and the map "
                          "model puts the notes on them, at every difficulty; a checkpoint, or no value for the released "
-                         "one (default: with the newest map model, the released one from rhythm.AUTO_STARS up)")
+                         "one (default: with the newest map model or one that takes a pattern plan, the released one from rhythm.AUTO_STARS up)")
     ap.add_argument("--no-rhythm", action="store_true", help="no rhythm model: the map model times the notes itself")
     ap.add_argument("--song-aim", action="store_true",
                     help="hits per second, tech and pass as human mappers map songs like this one at those stars "
@@ -178,6 +185,9 @@ def parser():
 
 
 def load_map_model(version=hub.NEWEST, ckpt=None, dev="cuda"):
+    if version == "1.2" and not ckpt:
+        from bsgen.legacy12 import hub as old_hub, sample as old_sample
+        return old_sample.load_model(old_hub.map_model(), dev)
     if version in hub.LEGACY and not ckpt:
         from bsgen.legacy import hub as old_hub, sample as old_sample
         return old_sample.load_model(old_hub.map_model(version), dev)
@@ -185,11 +195,16 @@ def load_map_model(version=hub.NEWEST, ckpt=None, dev="cuda"):
 
 
 def legacy_files(version):
+    if version == "1.2":
+        from bsgen.legacy12 import hub as old_hub
+        return old_hub.map_model()
     from bsgen.legacy import hub as old_hub
     return old_hub.map_model(version)
 
 
 def legacy_run(args, model=None, log=print, progress=None, player=None):
+    if args.model == "1.2":
+        return legacy12_run(args, model, log, progress, player)
     from bsgen.legacy import generate as old
     new = vars(parser().parse_args([]))
     la = old.parser().parse_args(["--stars", "1"])
@@ -231,6 +246,20 @@ def legacy_run(args, model=None, log=print, progress=None, player=None):
     return zip_path
 
 
+def legacy12_run(args, model=None, log=print, progress=None, player=None):
+    from bsgen.legacy12 import generate as old
+    new = vars(parser().parse_args([]))
+    la = old.parser().parse_args([])
+    for k, v in vars(args).items():
+        if hasattr(la, k) and k != "model" and v != new.get(k):
+            setattr(la, k, v)
+    la.model = "1.2"
+    if la.replay and player is None:
+        player = botplay.load_player(hub.player_model(), args.device)
+    old_model = model if isinstance(model, old.sample.Generator) else None
+    return old.make_map(la, old_model, log, progress, player=player)
+
+
 def run(args, model=None, log=print, progress=None, player=None, lighter=None):
     if not getattr(args, "youtube", None):
         return make_map(args, model, log, progress, player, lighter)
@@ -256,8 +285,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if args.environment == "auto":
-        envs = lightmodel.AUTO_ENVS
-        args.environment = envs[np.random.default_rng(args.seed).integers(len(envs))]
+        args.environment = lightmodel.auto_env(args.seed, Path(args.audio or args.map or "").stem)
         log(f"scene: {args.environment}")
 
     import librosa
@@ -342,7 +370,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
     if not getattr(model, "controls", False) and (styles or args.mapper or args.nps):
         log("note: this model only takes a star rating; the other controls are ignored")
 
-    auto_rhythm = args.rhythm is None and args.model == hub.NEWEST and not args.ckpt
+    auto_rhythm = args.rhythm is None and (getattr(model, "pattern", False) or (args.model == hub.NEWEST and not args.ckpt))
     rpath = hub.rhythm_model() if args.rhythm == "on" or (auto_rhythm and max(stars) >= rhythm.AUTO_STARS) \
         else args.rhythm
     rhythm_model = rhythm.loaded(rpath, args.device) if rpath and not args.no_rhythm and not args.human_times else None
@@ -355,7 +383,16 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                         **{"pass": args.pass_rating if args.pass_rating is not None or not aim else aim["pass"]})
         return aim, controls
 
+    kept_rhythms = {}
+
     def rhythms(jobs):
+        if not (planned_model or RHYTHM_AT_WANTED):
+            return write_rhythms(jobs)
+        new = [j for j in dict.fromkeys(jobs) if j not in kept_rhythms]
+        kept_rhythms.update(zip(new, write_rhythms(new)))
+        return [kept_rhythms[j] for j in jobs]
+
+    def write_rhythms(jobs):
         if rhythm_model is None or args.human_times:
             return [None] * len(jobs)
         out = [None] * len(jobs)
@@ -369,7 +406,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             levels = [aim and aim["hps"] for aim, _ in plans]
             ratings = [None if k["tech"] is None and k["pass"] is None else (k["tech"], k["pass"]) for _, k in plans]
             for i, ask in enumerate(asks):
-                if sample.style_above(ask, style):
+                if style is not None and STYLE_AIM:
                     typ = sample.typical_ratings_for(ask, style)
                     levels[i] = levels[i] or typ["nps"] * HITS_PER_NOTE
                     ratings[i] = ratings[i] or (typ["tech"], typ["pass"])
@@ -380,7 +417,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                                  args.rhythm_tries, level=levels[0] if one else levels, style=style,
                                  temp=args.rhythm_temp, top_p=args.rhythm_top_p, cfg=args.rhythm_cfg, dev=args.device,
                                  gen=rgen, ratings=ratings[0] if one else ratings, audio_cfg=args.rhythm_audio_cfg,
-                                 wanted=wanted[0] if one else wanted)
+                                 wanted=wanted[0] if one else wanted, check=getattr(progress, "check", None))
             for j, t in zip(part, [got] if one else got):
                 out[j] = t
         return out
@@ -391,23 +428,29 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             gen = torch.Generator(device=args.device).manual_seed(args.seed)
             stream = torch.cuda.Stream() if str(args.device).startswith("cuda") else None
         rng = np.random.default_rng(args.seed)
-        aim, controls = plan(ask, speed)
+        planned = getattr(model, "pattern", False)
+        aim, controls = plan(star if planned else ask, speed)
         if args.human_times:
             if not args.map:
                 raise SystemExit("--human-times needs --map")
             times = np.unique(np.round((diff.notes["beat"] - offset) * tokens.TICKS).astype(np.int64))
         elif times is not None:
             say(f"rhythm: {len(times)} hits" + (f" (aim {aim['hps']:.1f}/s, tech {aim['tech']:.1f}, pass {aim['pass']:.1f})" if aim else ""))
+        made_at, patterns = ask, None
+        if planned and times is not None:
+            made_at = star
+            patterns = pattern.make_plan(pattern_plan, times, grid_times, 0.0, star, logmel, fps, song_summary,
+                                         lift=(ask - star) * PLAN_LIFT, rng=np.random.default_rng(args.seed))
         hooks = []
         with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
-            temp, top_p = sample.map_sampling(ask)
+            temp, top_p = sample.map_sampling(made_at)
             temp, top_p = temp if args.temp is None else args.temp, top_p if args.top_p is None else args.top_p
-            ev, b = sample.generate(model, logmel, fps, grid_times, 0.0, n_beats, ask, args.cfg, temp,
+            ev, b = sample.generate(model, logmel, fps, grid_times, 0.0, n_beats, made_at, args.cfg, temp,
                                     top_p, dev=args.device, log=say if args.verbose else None,
                                     candidates=args.candidates, controls=controls, styles=styles,
                                     max_loop=args.max_loop, dry=args.dry, xtc=args.xtc, min_p=args.min_p,
-                                    turn=args.turn, hold=args.hold, times=times, arc_boost=args.arc_boost, arc_rate=args.arc_rate, music_fit=args.music_fit, off_grid=args.off_grid, repeat=args.repeat,
-                                    use_plan=not args.no_plan, hooks=hooks, gen=gen, rng=rng, floor=sample.xtc_floor(star), top=sample.top_bias(star),
+                                    turn=args.turn, hold=args.hold, times=times, pattern=patterns, arc_boost=args.arc_boost, arc_rate=args.arc_rate, music_fit=args.music_fit, off_grid=args.off_grid, repeat=args.repeat,
+                                    use_plan=not args.no_plan, hooks=hooks, gen=gen, rng=rng, floor=sample.xtc_floor(star), top=sample.top_bias(star), fast=star,
                                     progress=lambda beat: progress(name, beat, n_beats) if progress else None)
         bombs, walls, arcs = tokens.to_objects(ev, offset)
         notes = tokens.to_notes(ev, offset)
@@ -416,7 +459,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         walls["duration"] = np.minimum(walls["duration"], end_beat - walls["beat"])
         arcs = arcs[arcs["tail_beat"] <= end_beat]
         if not args.no_bombs:
-            bombs = sample.reset_bombs(notes, bombs, walls, tempo.to_seconds)
+            bombs = sample.reset_bombs(notes, bombs, walls, tempo.to_seconds, args.seed or 0)
         if late:
             say(f"{late} notes in the song's quiet ending left out")
         secs = tempo.to_seconds(notes["beat"])
@@ -432,7 +475,12 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 + (f" (made at {ask:g}★)" if ask != star else ""))
         return dict(difficulty=name, stars=star, ask=ask, est=est and round(est[0], 1), notes=notes,
                     label=f"bsgen {star:g}★" + (f" (est {est[0]:.1f})" if est else ""), njs=speed, bombs=bombs,
-                    walls=walls, arcs=arcs)
+                    walls=walls, arcs=arcs, on=rhythm.on_sound(np.unique(secs), marks))
+
+    marks = rhythm.accents(logmel, fps)
+    planned_model = getattr(model, "pattern", False)
+    pattern_plan = pattern.load_plan(hub.pattern_plan()) if planned_model else None
+    song_summary = songstars.features(logmel, fps) if planned_model else None
 
     def finish(lv):
         name, notes = lv["difficulty"], lv["notes"]
@@ -445,7 +493,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             show = lights.lightshow(notes, beat_times, logmel, fps, args.seed)
         else:
             show = lightmodel.lightshow(lighter, logmel, fps, beat_times, offset, notes, args.environment,
-                                        seed=args.seed, dev=args.device)
+                                        seed=args.seed, dev=args.device, same_colour=lighter.song_in is not None,
+                                        repeat=lightmodel.REPEAT_SIM, calm=lightmodel.CALM, calm_from=lightmodel.CALM_FROM)
         if show:
             say(f"lights: {len(show)} events, {len(show) / max(notes['beat'].max() - notes['beat'].min(), 1):.1f} per beat")
         lv["lights"] = show
@@ -472,14 +521,14 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
     workers = max(1, min(parallel, len(stars) * k))
     with ThreadPoolExecutor(workers) as ex, sample.together(workers):
         made = [[] for _ in stars]
-        asks = [first_asks(s, k) for s in stars]
+        asks = [first_asks(s, k, planned_model) for s in stars]
         rounds = STAR_ROUNDS if k > 1 else 1
         for round_ in range(rounds):
             todo = [(i, j, a) for i in range(len(stars)) for j, a in enumerate(asks[i])]
             if not todo:
                 break
             quiet = (lambda m: None) if k > 1 and not args.verbose else None
-            times = rhythms([(a, njs[i], stars[i]) for i, _, a in todo])
+            times = rhythms([(stars[i] if RHYTHM_AT_WANTED or planned_model else a, njs[i], stars[i]) for i, _, a in todo])
             beats = {}
 
             def tick(i, j):

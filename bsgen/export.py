@@ -17,7 +17,7 @@ def typical_njs(stars):
 
 
 REACTION_STARS = [2, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 13]
-REACTION_MS = [1009, 879, 771, 714, 643, 600, 558, 540, 500, 475, 464]
+REACTION_MS = [1338, 1071, 893, 845, 754, 664, 596, 579, 526, 505, 476]
 
 
 def spawn_offset(stars, njs, bpm):

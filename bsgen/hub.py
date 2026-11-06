@@ -2,10 +2,11 @@ import os
 from pathlib import Path
 
 REPO = "cata121/bsgen-1.0"
-VERSIONS = ["1.2", "1.1", "1.0"]
+VERSIONS = ["1.3", "1.2", "1.1", "1.0"]
 NEWEST = VERSIONS[0]
-LEGACY = ("1.1", "1.0")
-MAP_NOTES = {"1.2": "newest, most stable", "1.1": "more creative, sometimes weird", "1.0": "first release"}
+LEGACY = ("1.2", "1.1", "1.0")
+FIXED_STARS = ("1.1", "1.0")
+MAP_NOTES = {"1.3": "newest", "1.2": "previous release", "1.1": "more creative, sometimes weird", "1.0": "first release"}
 
 
 def fetch(*names, version=NEWEST):
@@ -88,6 +89,13 @@ LOCAL_SONG_STARS = LOCAL_MAP.with_name("song_stars.npz")
 
 def song_stars_model():
     return LOCAL_SONG_STARS if LOCAL_SONG_STARS.exists() else fetch("song_stars.npz")[0]
+
+
+LOCAL_PATTERN_PLAN = LOCAL_MAP.with_name("pattern_plan.npz")
+
+
+def pattern_plan():
+    return LOCAL_PATTERN_PLAN if LOCAL_PATTERN_PLAN.exists() else fetch("pattern_plan.npz")[0]
 
 
 def timing_model():
