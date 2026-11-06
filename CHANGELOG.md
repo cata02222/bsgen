@@ -1,5 +1,9 @@
 # Changelog
 
+**1.3.1** (2026-11-07)
+- reset bombs sit where the hand is, not off to the side
+- Stop works while the song is being read and the rhythm made
+
 **1.3** (2026-11-06)
 - new map model, far fewer odd resets
 - new rhythm model

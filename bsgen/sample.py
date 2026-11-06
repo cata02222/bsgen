@@ -1589,7 +1589,12 @@ def reset_bombs(notes, bombs, walls, to_seconds, seed=0, cell_gap_beats=CELL_GAP
     pairs = [(h, p, n) for h in (0, 1) for p, n in _hand_resets(notes, secs, h)]
     beats = notes["beat"]
     rows = []
+    drop = np.zeros(len(bombs), bool)
+    side = []
     for h, p, n in pairs:
+        at = (bombs["beat"] > beats[p]) & (bombs["beat"] < beats[n])
+        if np.any(at) and not _in_path(notes, p, n, bombs[at]):
+            side.append((h, p, n))
         if int(notes["cut_dir"][p]) not in DOWN_DIRS or secs[n] - secs[p] < RESET_MIN_S:
             continue
         b0, b1 = float(beats[p]), float(beats[n])
@@ -1599,7 +1604,8 @@ def reset_bombs(notes, bombs, walls, to_seconds, seed=0, cell_gap_beats=CELL_GAP
             continue
         if any(b0 < r[1] and r[0] < b1 for r in rows):
             continue
-        if np.any((bombs["beat"] > b0) & (bombs["beat"] < b1)):
+        gap_bombs = (bombs["beat"] > b0) & (bombs["beat"] < b1)
+        if np.any(gap_bombs & ~drop) and _in_path(notes, p, n, bombs[gap_bombs & ~drop]):
             continue
         spb = float(secs[n] - secs[p]) / gap
         beat = max(b0 + gap * 2 / 3, b1 - FLOOR_FAR_S / spb)
@@ -1607,8 +1613,11 @@ def reset_bombs(notes, bombs, walls, to_seconds, seed=0, cell_gap_beats=CELL_GAP
         t = float(to_seconds(np.array([beat]))[0])
         cols = [c for c in range(4) if _bomb_fits(notes, secs, walls, beat, t, c, 0, None if both else h, cell_gap_beats)]
         walled = sum(_walled(walls, beat, c, cell_gap_beats) for c in range(4))
-        if len(cols) >= 2 and len(cols) + walled >= 3:
+        lanes = {int(notes["line"][p]), int(notes["line"][n])}
+        if len(cols) >= 2 and len(cols) + walled >= 3 and lanes & set(cols):
             rows.append((b0, b1, beat, None if both else h, cols))
+            drop |= gap_bombs
+    bombs = _into_path(bombs, drop, notes, secs, walls, to_seconds, side, cell_gap_beats)
     new = [(beat, c, 0) for _, _, beat, _, cols in rows for c in cols]
     add = np.zeros(len(new), BOMB_DTYPE)
     if new:
@@ -1618,6 +1627,35 @@ def reset_bombs(notes, bombs, walls, to_seconds, seed=0, cell_gap_beats=CELL_GAP
     out = _sweep(out, notes, secs, walls, to_seconds, pairs, rng, cell_gap_beats)
     out["time"] = to_seconds(out["beat"])
     return out[np.argsort(out["beat"], kind="stable")]
+
+
+def _into_path(bombs, drop, notes, secs, walls, to_seconds, side, cell_gap_beats):
+    bombs, keep = bombs.copy(), ~drop
+    for h, p, n in side:
+        at = np.flatnonzero((bombs["beat"] > notes["beat"][p]) & (bombs["beat"] < notes["beat"][n]) & keep)
+        if not len(at) or _in_path(notes, p, n, bombs[at]):
+            continue
+        lanes = np.array(sorted({int(notes["line"][p]), int(notes["line"][n])}))
+        to = lanes[np.abs(bombs["line"][at][:, None] - lanes[None]).argmin(1)]
+        times = to_seconds(bombs["beat"][at])
+        fits = all(_bomb_fits(notes, secs, walls, float(bombs["beat"][j]), float(t), int(c), int(bombs["layer"][j]), h,
+                              cell_gap_beats) for j, t, c in zip(at, times, to))
+        if fits:
+            bombs["line"][at] = to
+            seen = set()
+            for j in at:
+                key = (float(bombs["beat"][j]), int(bombs["line"][j]), int(bombs["layer"][j]))
+                keep[j] = key not in seen
+                seen.add(key)
+        else:
+            keep[at] = False
+    return bombs[keep]
+
+
+def _in_path(notes, p, n, bombs):
+    d, row = int(notes["cut_dir"][p]), int(notes["layer"][p])
+    side = bombs["layer"] <= row if d in DOWN_DIRS else bombs["layer"] >= row if d in UP_DIRS else True
+    return bool(np.any(side & np.isin(bombs["line"], [int(notes["line"][p]), int(notes["line"][n])])))
 
 
 def _sweep(bombs, notes, secs, walls, to_seconds, pairs, rng, cell_gap_beats):
