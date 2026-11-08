@@ -12,6 +12,9 @@ struct Consts {
     note0: usize,
     arc0: usize,
     bomb0: usize,
+    chain0: usize,
+    kind_chain: i64,
+    obj_chains: i64,
     wall0: usize,
     dur0: usize,
     events_end: usize,
@@ -52,12 +55,17 @@ struct Consts {
     double_from: i64,
     double_push: f64,
     double_max: f64,
+    double_floor_push: f64,
+    double_floor_max: f64,
     air_rate: f64,
     air_from: i64,
     air_push: f64,
     air_max: f64,
     air_any_push: f64,
     air_any_max: f64,
+    arc_pair_pen: f64,
+    arc_chain_pen: f64,
+    arc_shape: Vec<f64>,
     floor_every: i64,
     hold_from: f64,
     hold_grow: f64,
@@ -102,6 +110,9 @@ impl NativeConsts {
             note0: get(d, "note0")?,
             arc0: get(d, "arc0")?,
             bomb0: get(d, "bomb0")?,
+            chain0: get(d, "chain0")?,
+            kind_chain: get(d, "kind_chain")?,
+            obj_chains: get(d, "obj_chains")?,
             wall0: get(d, "wall0")?,
             dur0: get(d, "dur0")?,
             events_end: get(d, "events_end")?,
@@ -142,12 +153,17 @@ impl NativeConsts {
             double_from: get(d, "double_from")?,
             double_push: get(d, "double_push")?,
             double_max: get(d, "double_max")?,
+            double_floor_push: get(d, "double_floor_push")?,
+            double_floor_max: get(d, "double_floor_max")?,
             air_rate: get(d, "air_rate")?,
             air_from: get(d, "air_from")?,
             air_push: get(d, "air_push")?,
             air_max: get(d, "air_max")?,
             air_any_push: get(d, "air_any_push")?,
             air_any_max: get(d, "air_any_max")?,
+            arc_pair_pen: get(d, "arc_pair_pen")?,
+            arc_chain_pen: get(d, "arc_chain_pen")?,
+            arc_shape: get(d, "arc_shape")?,
             floor_every: get(d, "floor_every")?,
             hold_from: get(d, "hold_from")?,
             hold_grow: get(d, "hold_grow")?,
@@ -319,6 +335,7 @@ struct State {
     fast_gap: i64,
     fast_span: i64,
     fast_ticks: Vec<i64>,
+    air_cue: i64,
     hand_cap: i64,
     hand_gap: i64,
     hand_span: i64,
@@ -339,6 +356,7 @@ struct State {
     swings_n: i64,
     air_free_n: i64,
     air_any: i64,
+    double_floor: i64,
     head: [Option<i64>; 2],
     rest: [Option<i64>; 2],
     owe: [bool; 2],
@@ -359,6 +377,10 @@ struct State {
     notes_now: [Vec<i64>; 2],
     prev_note: [i64; 2],
     arc_done: [bool; 2],
+    arc_now: [bool; 2],
+    arc_prev: [bool; 2],
+    arc_head: [Option<i64>; 2],
+    chain_done: [bool; 2],
     note_ticks: Vec<i64>,
     arc_ticks: Vec<i64>,
     objects_now: bool,
@@ -500,6 +522,7 @@ impl State {
                 }
                 if let Some(&m) = self.notes_now[h].iter().max() {
                     self.prev_note[h] = m;
+                    self.arc_prev[h] = self.arc_now[h];
                 }
             }
         }
@@ -510,6 +533,8 @@ impl State {
         self.stack = [0, 0];
         self.first_dir = [None, None];
         self.arc_done = [false, false];
+        self.arc_now = [false, false];
+        self.chain_done = [false, false];
         let keep = self.behind.max(self.wall_gap);
         self.walls.retain(|w| w.1 + keep > tick);
     }
@@ -687,6 +712,20 @@ impl State {
         (self.hand_ticks.len() - from) as i64 >= self.hand_cap
     }
 
+    fn cue_stop(&self, h: usize) -> bool {
+        let (Some(t), Some(c)) = (self.tick, self.cut_tick[h]) else { return false };
+        if self.air_cue == 0 || self.owe[h] {
+            return false;
+        }
+        match &self.times {
+            None => t + 1 - c < self.air_cue,
+            Some(times) => {
+                let j = left(times, t + 1);
+                j < times.len() && times[j] - c < self.air_cue
+            }
+        }
+    }
+
     fn fast_stop(&self, h: usize) -> bool {
         let (Some(t), Some(c)) = (self.tick, self.cut_tick[h]) else { return false };
         if self.fast_cap == 0 {
@@ -841,6 +880,7 @@ impl State {
             for h in 0..2 {
                 if self.swing_tick[h] != self.tick
                     && !self.fast_stop(h)
+                    && !self.cue_stop(h)
                     && let Some(f) = self.face[h]
                 {
                     ok[self.swing(h, !f, true)] = true;
@@ -857,6 +897,13 @@ impl State {
             let room = arcs as f64 <= c.arc_cap * notes as f64;
             for h in 0..2 {
                 ok[c.arc0 + h] = room && self.stack[h] > 0 && self.prev_moment[h].is_some() && !self.arc_done[h];
+            }
+        }
+        if self.objects & c.obj_chains != 0 {
+            for h in 0..2 {
+                ok[c.chain0 + h] = self.stack[h] == 1
+                    && !self.chain_done[h]
+                    && self.notes_now[h].first().is_some_and(|n| n % 9 != 8);
             }
         }
         if !self.swings {
@@ -887,7 +934,7 @@ impl State {
                     None => ok[self.swing(h, true, false)] = true,
                     Some(face) => {
                         let f = !face;
-                        ok[self.swing(h, f, true)] = !self.fast_stop(h);
+                        ok[self.swing(h, f, true)] = !self.fast_stop(h) && !self.cue_stop(h);
                         ok[self.swing(h, if self.late(h) { !f } else { f }, false)] = true;
                     }
                 }
@@ -981,17 +1028,48 @@ impl State {
         if self.moments_n < c.double_from || self.need_note.is_some() || self.tick.is_none() {
             return Vec::new();
         }
-        let over = self.doubles_n as f64 / self.moments_n as f64 - c.double_share;
-        if over <= 0.0 {
+        let share = self.doubles_n as f64 / self.moments_n as f64;
+        let over = share - c.double_share;
+        let under = self.double_floor as f64 / 10000.0 - share;
+        let amount = if over > 0.0 {
+            (c.double_push * over / 0.1).min(c.double_max)
+        } else if under > 0.0 {
+            -(c.double_floor_push * under / 0.05).min(c.double_floor_max)
+        } else {
             return Vec::new();
-        }
-        let amount = (c.double_push * over / 0.1).min(c.double_max);
+        };
         let mut out = Vec::new();
         for h in 0..2 {
             if self.stack[1 - h] != 0 && self.stack[h] == 0 {
                 for f in [false, true] {
                     out.push((self.swing(h, f, false), amount));
                 }
+            }
+        }
+        out
+    }
+
+    fn arc_penalty(&self) -> Vec<(usize, f64)> {
+        let c = &self.c;
+        let mut out = Vec::new();
+        for h in 0..2 {
+            if self.arc_now[h] {
+                continue;
+            }
+            let near = matches!((self.arc_head[1 - h], self.prev_moment[h]), (Some(o), Some(p)) if (p - o).abs() <= c.ticks / 4);
+            let mut a = if self.arc_now[1 - h] || near { c.arc_pair_pen } else { 0.0 };
+            if self.arc_prev[h] {
+                a += c.arc_chain_pen;
+            }
+            if let Some(&cur) = self.notes_now[h].iter().max()
+                && self.prev_note[h] != c.no_note
+            {
+                let p = self.prev_note[h];
+                let i = ((p % 9 * 9 + cur % 9) * 3 + (p / 9 / 4 - cur / 9 / 4).abs()) as usize;
+                a -= c.arc_shape[i];
+            }
+            if a != 0.0 {
+                out.push((c.arc0 + h, a));
             }
         }
         out
@@ -1035,6 +1113,7 @@ impl State {
         out.extend(self.hold_penalty());
         out.extend(self.double_penalty());
         out.extend(self.air_penalty());
+        out.extend(self.arc_penalty());
         out
     }
 
@@ -1107,7 +1186,12 @@ impl State {
             self.hit_now();
         } else if c.arc0 <= k && k < c.bomb0 {
             self.arc_done[k - c.arc0] = true;
+            self.arc_now[k - c.arc0] = true;
+            self.arc_head[k - c.arc0] = self.prev_moment[k - c.arc0];
             self.arc_ticks.push(self.tick.unwrap());
+        } else if c.chain0 <= k && k < c.chain0 + 2 {
+            self.chain_done[k - c.chain0] = true;
+            self.arc_done[k - c.chain0] = true;
         } else if c.bomb0 <= k && k < c.wall0 {
             let cell = (k - c.bomb0) as i64;
             self.add_cell(2, cell as u8);
@@ -1149,7 +1233,7 @@ impl Rules {
     #[new]
     #[pyo3(signature = (consts, tick, kind, hand, forehand, air, cell, dir, shape, dur, end_tick, swings, objects,
                         max_loop, behind, dry, turn, copy, hold, times, double_gap, cell_gap, swing_gap, uncross, near_gap,
-                        wall_gap, vision_gap, slide_gap, floor_rate, floor_min, floor_far, fast_cap, fast_gap, fast_span, hand_cap, hand_gap, hand_span, air_any))]
+                        wall_gap, vision_gap, slide_gap, floor_rate, floor_min, floor_far, fast_cap, fast_gap, fast_span, air_cue, hand_cap, hand_gap, hand_span, air_any, double_floor))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         consts: &NativeConsts,
@@ -1186,10 +1270,12 @@ impl Rules {
         fast_cap: i64,
         fast_gap: i64,
         fast_span: i64,
+        air_cue: i64,
         hand_cap: i64,
         hand_gap: i64,
         hand_span: i64,
         air_any: i64,
+        double_floor: i64,
     ) -> PyResult<Self> {
         let c = consts.c.clone();
         let mut s = State {
@@ -1213,6 +1299,7 @@ impl Rules {
             fast_gap,
             fast_span,
             fast_ticks: Vec::new(),
+            air_cue,
             hand_cap,
             hand_gap,
             hand_span,
@@ -1233,6 +1320,7 @@ impl Rules {
             swings_n: 0,
             air_free_n: 0,
             air_any,
+            double_floor,
             head: [None, None],
             rest: [None, None],
             owe: [false, false],
@@ -1264,6 +1352,10 @@ impl Rules {
             notes_now: [Vec::new(), Vec::new()],
             prev_note: [c.no_note, c.no_note],
             arc_done: [false, false],
+            arc_now: [false, false],
+            arc_prev: [false, false],
+            arc_head: [None, None],
+            chain_done: [false, false],
             note_ticks: Vec::new(),
             arc_ticks: Vec::new(),
             objects_now: false,
@@ -1307,6 +1399,11 @@ impl Rules {
                 s.hit_now();
             } else if k == k_arc {
                 s.arc_ticks.push(t);
+                s.arc_now[h] = true;
+                s.arc_head[h] = s.prev_moment[h];
+            } else if k == c.kind_chain {
+                s.chain_done[h] = true;
+                s.arc_done[h] = true;
             } else if k == k_swing {
                 let (fh, a) = (forehand[i], air[i]);
                 let same = s.face[h] == Some(fh) && !a;
@@ -1515,9 +1612,11 @@ fn logsumexp(x: impl Iterator<Item = f32> + Clone) -> f32 {
 }
 
 #[pyfunction]
+#[pyo3(signature = (step, lg, temp, top_p, min_p, u, xtc, xtc_threshold, xtc_floor, time0, swing0, eos, group0=0, group1=0))]
 #[allow(clippy::too_many_arguments)]
 fn finish(py: Python<'_>, step: &Step, mut lg: PyReadwriteArray2<'_, f32>, temp: f32, top_p: f32, min_p: f32,
-          u: Vec<f32>, xtc: Vec<bool>, xtc_threshold: f32, xtc_floor: f32, time0: usize, swing0: usize, eos: usize)
+          u: Vec<f32>, xtc: Vec<bool>, xtc_threshold: f32, xtc_floor: f32, time0: usize, swing0: usize, eos: usize,
+          group0: usize, group1: usize)
           -> PyResult<Vec<usize>> {
     let a = rows(&mut lg, step)?;
     py.detach(|| {
@@ -1564,8 +1663,33 @@ fn finish(py: Python<'_>, step: &Step, mut lg: PyReadwriteArray2<'_, f32>, temp:
                     }
                 }
             }
+            let in_group = |t: usize| t >= group0 && t < group1;
+            let w: f32 = if min_p > 0.0 { 0.0 } else { cand.iter().filter(|c| in_group(c.1)).map(|c| c.0).sum() };
             cand.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)));
-            if min_p > 0.0 {
+            if w > 0.0 {
+                let (mut cum, mut placed, mut keep_group) = (0.0f32, false, false);
+                for c in cand.iter_mut().filter(|c| !in_group(c.1)) {
+                    if !placed && w >= c.0 {
+                        placed = true;
+                        keep_group = cum < top_p;
+                        cum += w;
+                    }
+                    cum += c.0;
+                    if cum - c.0 >= top_p {
+                        c.0 = 0.0;
+                    }
+                }
+                if !placed {
+                    keep_group = cum < top_p;
+                }
+                let mut inside = 0.0f32;
+                for c in cand.iter_mut().filter(|c| in_group(c.1)) {
+                    inside += c.0;
+                    if !keep_group || (inside - c.0) / w >= top_p {
+                        c.0 = 0.0;
+                    }
+                }
+            } else if min_p > 0.0 {
                 let floor = min_p * cand[0].0;
                 for c in cand.iter_mut() {
                     if c.0 < floor {

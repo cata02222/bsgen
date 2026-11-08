@@ -10,7 +10,7 @@ EVENT_DTYPE = np.dtype([
     ("cell", "i1"), ("dir", "i1"), ("note", "i4"),
     ("shape", "i2"), ("dur", "i4"),
 ])
-SWING, NOTE, ARC, BOMB, WALL = 0, 1, 2, 3, 4
+SWING, NOTE, ARC, BOMB, WALL, CHAIN = 0, 1, 2, 3, 4, 5
 NO_HAND = 2
 
 WALL_X, WALL_Y, WALL_W, WALL_H = range(-2, 6), range(3), range(1, 5), range(1, 6)
@@ -25,6 +25,11 @@ RATING_STEP, N_RATINGS = 0.5, 33
 COND_FIELDS = ("stars", "style", "mapper", "njs", "nps", "objects", "pass", "acc", "tech")
 WNPS_STEP, N_WNPS = 0.5, 49
 OBJ_WALLS, OBJ_BOMBS, OBJ_ARCS = 1, 2, 4
+OBJ_CHAINS = 8
+CHAIN_BEATS, CHAIN_SLICES, CHAIN_SQUISH = 0.0625, 5, 1.0
+DIR_STEP = {0: (0, 1), 1: (0, -1), 2: (-1, 0), 3: (1, 0), 4: (-1, 1), 5: (1, 1), 6: (-1, -1), 7: (1, -1)}
+AMOUNT_FIELDS = ("walls", "bombs", "arcs", "chains")
+AMOUNTS = ("none", "rare", "normal", "lots")
 
 
 def wall_shape(x, y, w, h):
@@ -67,7 +72,13 @@ class Vocab:
         self.cond_size = sizes
         self.controls_end = k
         self.wnps0 = k
-        self.size = k + N_WNPS + 1
+        self.plan_end = k + N_WNPS + 1
+        self.chain0 = self.plan_end
+        self.amount0, k = {}, self.chain0 + 2
+        for f in AMOUNT_FIELDS:
+            self.amount0[f] = k
+            k += len(AMOUNTS) + 1
+        self.size = k
 
     def star(self, stars):
         if stars is None:
@@ -95,17 +106,28 @@ class Vocab:
             return self.wnps0 + N_WNPS
         return self.wnps0 + int(np.clip(round(value / WNPS_STEP), 0, N_WNPS - 1))
 
+    def amount(self, field, value):
+        return self.amount0[field] + (len(AMOUNTS) if value is None else int(value))
+
     def prefix(self, cond):
         if not isinstance(cond, dict):
             return [self.BOS, self.star(cond)]
         out = [self.BOS] + [self.cond(f, cond.get(f)) for f in COND_FIELDS]
-        return out + [self.wnps(cond["wnps"])] if "wnps" in cond else out
+        if "wnps" in cond:
+            out.append(self.wnps(cond["wnps"]))
+        if "amounts" in cond:
+            out += [self.amount(f, (cond["amounts"] or {}).get(f)) for f in AMOUNT_FIELDS]
+        return out
 
     def none_like(self, cond, keep=("objects",)):
         if not isinstance(cond, dict):
             return None
         out = {f: cond.get(f) if f in keep else None for f in COND_FIELDS}
-        return out | {"wnps": None} if "wnps" in cond else out
+        if "wnps" in cond:
+            out["wnps"] = None
+        if "amounts" in cond:
+            out["amounts"] = cond["amounts"]
+        return out
 
     def swing(self, hand, forehand, air):
         return self.swing0 + hand * 4 + forehand * 2 + air
@@ -115,6 +137,9 @@ class Vocab:
 
     def arc(self, hand):
         return self.arc0 + hand
+
+    def chain(self, hand):
+        return self.chain0 + hand
 
     def bomb(self, cell):
         return self.bomb0 + cell
@@ -231,6 +256,8 @@ def encode(ev, t0, cond, beats=CONTEXT + WINDOW):
             out.append(VOCAB.arc(int(e["hand"])))
         elif k == BOMB:
             out.append(VOCAB.bomb(int(e["cell"])))
+        elif k == CHAIN:
+            out.append(VOCAB.chain(int(e["hand"])))
         else:
             out += [VOCAB.wall(int(e["shape"])), VOCAB.dur(int(e["dur"]))]
     out.append(VOCAB.EOS)
@@ -262,7 +289,26 @@ def decode(tokens, t0):
             ev.append((tick, BOMB, NO_HAND, False, False, k - VOCAB.bomb0, -1, -1, -1, 0))
         elif VOCAB.wall0 <= k < VOCAB.dur0:
             wall = k - VOCAB.wall0
+        elif VOCAB.chain0 <= k < VOCAB.chain0 + 2:
+            ev.append((tick, CHAIN, k - VOCAB.chain0, False, False, -1, -1, -1, -1, 0))
     return np.array(ev, EVENT_DTYPE)
+
+
+def add_chains(ev, chains, grid_offset):
+    if chains is None or not len(chains):
+        return ev, 0
+    notes = ev[ev["kind"] == NOTE]
+    have = {(int(t), int(h), int(c)) for t, h, c in zip(notes["tick"], notes["hand"], notes["cell"])}
+    ticks = np.round((np.asarray(chains["beat"]) - grid_offset) * TICKS).astype(np.int64)
+    new = set()
+    for t, h, x, y in zip(ticks, chains["color"], chains["line"], chains["layer"]):
+        if (int(t), int(h), int(y) * 4 + int(x)) in have:
+            new.add((int(t), int(h)))
+    if not new:
+        return ev, 0
+    at = [int(np.flatnonzero((ev["tick"] == t) & (ev["hand"] == h))[-1]) + 1 for t, h in sorted(new)]
+    add = np.array([(t, CHAIN, h, False, False, -1, -1, -1, -1, 0) for t, h in sorted(new)], EVENT_DTYPE)
+    return np.insert(ev, at, add), len(new)
 
 
 def to_notes(ev, grid_offset):
@@ -272,6 +318,24 @@ def to_notes(ev, grid_offset):
     out["line"], out["layer"] = n["cell"] % 4, n["cell"] // 4
     out["color"], out["cut_dir"] = n["hand"], n["dir"]
     return out
+
+
+def to_chains(ev, grid_offset):
+    from .beatmap import CHAIN_DTYPE
+    notes = ev[ev["kind"] == NOTE]
+    out = []
+    for c in ev[ev["kind"] == CHAIN]:
+        head = notes[(notes["tick"] == c["tick"]) & (notes["hand"] == c["hand"])]
+        if len(head) != 1 or int(head[0]["dir"]) not in DIR_STEP:
+            continue
+        x, y, d = int(head[0]["cell"]) % 4, int(head[0]["cell"]) // 4, int(head[0]["dir"])
+        dx, dy = DIR_STEP[d]
+        tx, ty = x + dx, y + dy
+        if not (0 <= tx <= 3 and 0 <= ty <= 2):
+            tx, ty = x, y
+        beat = c["tick"] / TICKS + grid_offset
+        out.append((beat, int(c["hand"]), x, y, d, beat + CHAIN_BEATS, tx, ty, CHAIN_SLICES, CHAIN_SQUISH))
+    return np.array(out, CHAIN_DTYPE) if out else np.zeros(0, CHAIN_DTYPE)
 
 
 def to_objects(ev, grid_offset):

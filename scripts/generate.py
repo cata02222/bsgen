@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bsgen import artwork, beatmap, botplay, export, hub, lightmodel, lights, pattern, rating, rhythm, sample, songstars, timing, tokens
+from bsgen import artwork, beatmap, botplay, export, hub, lightmodel, lights, lightseq, pattern, rating, rhythm, sample, songstars, timing, tokens
 from bsgen.tokens import SWING
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +54,7 @@ STAR_ORDER_GAP = 0.5
 PICK_OFF = 10.0
 PLAN_LIFT = 2.5
 PLAN_SPREAD = 0.8
+STYLE_PLAN_LIFT = {"tech": 3.2, "speed": -2.4, "midspeed": 0.0, "acc": 0.0}
 RHYTHM_AT_WANTED = False
 
 
@@ -109,6 +110,8 @@ def parser():
                     help="of those, take the one whose notes land on the strongest hits in the music")
     ap.add_argument("--off-grid", type=float, default=0.0,
                     help="penalty on notes off the 1/16-beat grid (triplets) where the music doesn't hit (0: off; ~3)")
+    ap.add_argument("--copy", type=float, default=0.0,
+                    help="logits toward the notes of an earlier part that sounds like this one, as human mappers repeat them (0: off)")
     ap.add_argument("--repeat", type=float, default=4.0,
                     help="keep a part that sounds like an earlier one to that part's off-beat family, straight or triplet, as human mappers do (0: off)")
     ap.add_argument("--njs", type=float, nargs="+",
@@ -153,8 +156,12 @@ def parser():
     ap.add_argument("--arc-boost", type=float, default=0.0, help="logits added to arcs where one is allowed")
     ap.add_argument("--arc-rate", type=float, default=0.0,
                     help="arcs per note to steer toward (human maps that have arcs: ~0.025); 0: off")
+    ap.add_argument("--walls", type=float, default=None,
+                    help="walls a minute to steer toward (default: by the stars, sample.WALL_RATE; 0: the model's own)")
     ap.add_argument("--min-p", type=float, default=0.0, help="keep tokens at least this share of the likeliest's (0: top-p)")
-    ap.add_argument("--style", help="acc, tech, midspeed or speed, or a blend like tech=0.7,speed=0.3")
+    ap.add_argument("--style-lift", type=float, default=1.0, help=argparse.SUPPRESS)
+    ap.add_argument("--pattern-plan", help=argparse.SUPPRESS)
+    ap.add_argument("--style", help="acc, tech, midspeed or speed, or a blend like tech=0.7,speed=0.3. A song whose beat could be counted at 200-245 BPM or half is mapped at the fast count for speed and midspeed (and with no style at 7★+), at half for tech")
     ap.add_argument("--mapper", help="map like this mapper (see --list-mappers)")
     ap.add_argument("--list-mappers", action="store_true")
     ap.add_argument("--nps", type=float, help="notes per second over the whole map")
@@ -166,9 +173,16 @@ def parser():
     ap.add_argument("--no-walls", action="store_true")
     ap.add_argument("--no-bombs", action="store_true")
     ap.add_argument("--no-arcs", action="store_true")
+    for kind in ("wall", "bomb", "arc", "chain"):
+        ap.add_argument(f"--{kind}-amount", choices=tokens.AMOUNTS, default=None,
+                        help=f"how many {kind}s for the stars (default: normal" + (", or none with --no-" + kind + "s)"
+                                                                                  if kind != "chain" else "; chains only when asked for)")
+                        + ", for map models trained with the amounts")
     ap.add_argument("--no-lights", action="store_true", help="leave the lightshow out")
-    ap.add_argument("--lights", choices=["model", "rules"], default="model",
-                    help="model: the lighting model; rules: lights that follow the notes and loudness by fixed rules")
+    ap.add_argument("--lights", choices=["model", "old", "rules"], default="model",
+                    help="model: the lighting model (the whole song heard at once, all difficulties' shows written "
+                         "together); old: the earlier lighting model; rules: lights that follow the notes and "
+                         "loudness by fixed rules")
     ap.add_argument("--environment", choices=["auto", *lightmodel.ENVS], default="auto",
                     help="the game scene the map is set in; the lighting model lights it like human maps set there "
                          "(auto: one of the scenes it knows best, by the seed)")
@@ -185,9 +199,9 @@ def parser():
 
 
 def load_map_model(version=hub.NEWEST, ckpt=None, dev="cuda"):
-    if version == "1.2" and not ckpt:
-        from bsgen.legacy12 import hub as old_hub, sample as old_sample
-        return old_sample.load_model(old_hub.map_model(), dev)
+    if version in FROZEN and not ckpt:
+        old = FROZEN[version]()
+        return old.sample.load_model(old.hub.map_model(), dev)
     if version in hub.LEGACY and not ckpt:
         from bsgen.legacy import hub as old_hub, sample as old_sample
         return old_sample.load_model(old_hub.map_model(version), dev)
@@ -195,16 +209,15 @@ def load_map_model(version=hub.NEWEST, ckpt=None, dev="cuda"):
 
 
 def legacy_files(version):
-    if version == "1.2":
-        from bsgen.legacy12 import hub as old_hub
-        return old_hub.map_model()
+    if version in FROZEN:
+        return FROZEN[version]().hub.map_model()
     from bsgen.legacy import hub as old_hub
     return old_hub.map_model(version)
 
 
 def legacy_run(args, model=None, log=print, progress=None, player=None):
-    if args.model == "1.2":
-        return legacy12_run(args, model, log, progress, player)
+    if args.model in FROZEN:
+        return frozen_run(args, model, log, progress, player)
     from bsgen.legacy import generate as old
     new = vars(parser().parse_args([]))
     la = old.parser().parse_args(["--stars", "1"])
@@ -246,14 +259,27 @@ def legacy_run(args, model=None, log=print, progress=None, player=None):
     return zip_path
 
 
-def legacy12_run(args, model=None, log=print, progress=None, player=None):
-    from bsgen.legacy12 import generate as old
+def _legacy12():
+    from bsgen.legacy12 import generate
+    return generate
+
+
+def _legacy13():
+    from bsgen.legacy13 import generate
+    return generate
+
+
+FROZEN = {"1.2": _legacy12, "1.3": _legacy13}
+
+
+def frozen_run(args, model=None, log=print, progress=None, player=None):
+    old = FROZEN[args.model]()
     new = vars(parser().parse_args([]))
     la = old.parser().parse_args([])
     for k, v in vars(args).items():
         if hasattr(la, k) and k != "model" and v != new.get(k):
             setattr(la, k, v)
-    la.model = "1.2"
+    la.model, la.out = args.model, args.out
     if la.replay and player is None:
         player = botplay.load_player(hub.player_model(), args.device)
     old_model = model if isinstance(model, old.sample.Generator) else None
@@ -274,6 +300,26 @@ def run(args, model=None, log=print, progress=None, player=None, lighter=None):
         except youtube.YouTubeError as e:
             raise SystemExit(str(e)) from None
         return make_map(args, model, log, progress, player, lighter)
+
+
+AUTO_FAST_STARS = 7.0
+STYLE_OCTAVE = {"speed": "fast", "midspeed": "fast", "tech": "half"}
+
+
+def style_name(args):
+    if not args.style:
+        return None
+    parts = [p.partition("=") for p in args.style.split(",")]
+    return max(parts, key=lambda p: float(p[2] or 1))[0].strip()
+
+
+def octave_want(args):
+    style = style_name(args)
+    if style:
+        return STYLE_OCTAVE.get(style)
+    if args.stars:
+        return "fast" if max(args.stars) >= AUTO_FAST_STARS else None
+    return "fast" if set(args.difficulty or ()) & {"Expert", "ExpertPlus"} else None
 
 
 def make_map(args, model=None, log=print, progress=None, player=None, lighter=None):
@@ -320,6 +366,12 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 log(f"timing: {bpm:.3f} BPM (given), first beat at {first * 1000:.0f} ms")
             else:
                 tempo, offset, secs = timing.detect_tempo(logmel, fps, root, args.device)
+                want = octave_want(args)
+                secs, changed = timing.choose_octave(secs, want)
+                if changed:
+                    tempo, offset = timing.tempo_map(secs)
+                    log(f"timing: {want} count for the {style_name(args) or 'stars asked'}: "
+                        + ", ".join(f"{a:.3f} -> {b:.3f} BPM" for _, a, b in changed))
                 bpm = secs[0][1]
                 log("timing: " + ", then ".join(f"{b:.3f} BPM" + (f" from {s:.1f} s" if s else "")
                                                 for s, b, _ in secs) + f", first beat at {secs[0][2] * 1000:.0f} ms")
@@ -378,12 +430,15 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
 
     def plan(ask, speed):
         aim = songstars.how(logmel, fps, ask) if args.song_aim else None
-        controls = dict(njs=speed, nps=args.nps, mapper=args.mapper, objects=objects, acc=args.acc_rating,
+        amounts = {f"{k}s": tokens.AMOUNTS.index(v) for k in ("wall", "bomb", "arc", "chain")
+                   if (v := getattr(args, f"{k}_amount")) is not None}
+        controls = dict(njs=speed, nps=args.nps, mapper=args.mapper, objects=objects, acc=args.acc_rating, amounts=amounts,
                         tech=args.tech_rating if args.tech_rating is not None or not aim else aim["tech"],
                         **{"pass": args.pass_rating if args.pass_rating is not None or not aim else aim["pass"]})
         return aim, controls
 
     kept_rhythms = {}
+    style_lift = args.style_lift * sum(w * STYLE_PLAN_LIFT[s] for s, w in styles.items()) / sum(styles.values()) if styles else 0.0
 
     def rhythms(jobs):
         if not (planned_model or RHYTHM_AT_WANTED):
@@ -440,7 +495,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         if planned and times is not None:
             made_at = star
             patterns = pattern.make_plan(pattern_plan, times, grid_times, 0.0, star, logmel, fps, song_summary,
-                                         lift=(ask - star) * PLAN_LIFT, rng=np.random.default_rng(args.seed))
+                                         lift=(ask - star) * PLAN_LIFT + (0.0 if pattern_plan.get("style") else style_lift),
+                                         rng=np.random.default_rng(args.seed), styles=styles)
         hooks = []
         with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
             temp, top_p = sample.map_sampling(made_at)
@@ -449,15 +505,17 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                                     top_p, dev=args.device, log=say if args.verbose else None,
                                     candidates=args.candidates, controls=controls, styles=styles,
                                     max_loop=args.max_loop, dry=args.dry, xtc=args.xtc, min_p=args.min_p,
-                                    turn=args.turn, hold=args.hold, times=times, pattern=patterns, arc_boost=args.arc_boost, arc_rate=args.arc_rate, music_fit=args.music_fit, off_grid=args.off_grid, repeat=args.repeat,
+                                    turn=args.turn, hold=args.hold, times=times, pattern=patterns, arc_boost=args.arc_boost, arc_rate=args.arc_rate, walls=args.walls, music_fit=args.music_fit, off_grid=args.off_grid, repeat=args.repeat, copy_notes=args.copy,
                                     use_plan=not args.no_plan, hooks=hooks, gen=gen, rng=rng, floor=sample.xtc_floor(star), top=sample.top_bias(star), fast=star,
                                     progress=lambda beat: progress(name, beat, n_beats) if progress else None)
         bombs, walls, arcs = tokens.to_objects(ev, offset)
+        chains = tokens.to_chains(ev, offset)
         notes = tokens.to_notes(ev, offset)
         late = int((notes["beat"] > end_beat).sum())
         notes, bombs, walls = (x[x["beat"] <= end_beat] for x in (notes, bombs, walls))
         walls["duration"] = np.minimum(walls["duration"], end_beat - walls["beat"])
         arcs = arcs[arcs["tail_beat"] <= end_beat]
+        chains = chains[chains["beat"] <= end_beat]
         if not args.no_bombs:
             bombs = sample.reset_bombs(notes, bombs, walls, tempo.to_seconds, args.seed or 0)
         if late:
@@ -466,7 +524,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         span = secs.max() - secs.min() if len(notes) else 1
         say(f"{ask:g}★, NJS {speed:g}: {len(notes)} notes, {len(notes) / span:.2f} notes/s, "
             f"swings {np.sum(ev['kind'] == SWING)} ({np.mean(ev['air'][ev['kind'] == SWING]):.0%} air), "
-            f"bombs {len(bombs)}, walls {len(walls)}, arcs {len(arcs)}")
+            f"bombs {len(bombs)}, walls {len(walls)}, arcs {len(arcs)}" + (f", chains {len(chains)}" if len(chains) else ""))
         say(f"probability the model put on moves the rules blocked: mean {b.mean():.1%}, "
             f"steps where it was over half: {np.mean(b > 0.5):.1%}")
         est = rating.estimate(notes, speed, tempo.to_seconds(notes["beat"]))
@@ -475,11 +533,11 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 + (f" (made at {ask:g}★)" if ask != star else ""))
         return dict(difficulty=name, stars=star, ask=ask, est=est and round(est[0], 1), notes=notes,
                     label=f"bsgen {star:g}★" + (f" (est {est[0]:.1f})" if est else ""), njs=speed, bombs=bombs,
-                    walls=walls, arcs=arcs, on=rhythm.on_sound(np.unique(secs), marks))
+                    walls=walls, arcs=arcs, chains=chains, on=rhythm.on_sound(np.unique(secs), marks))
 
     marks = rhythm.accents(logmel, fps)
     planned_model = getattr(model, "pattern", False)
-    pattern_plan = pattern.load_plan(hub.pattern_plan()) if planned_model else None
+    pattern_plan = pattern.load_plan(args.pattern_plan or hub.pattern_plan()) if planned_model else None
     song_summary = songstars.features(logmel, fps) if planned_model else None
 
     def finish(lv):
@@ -489,6 +547,8 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             stream = torch.cuda.Stream() if str(args.device).startswith("cuda") else None
         if args.no_lights:
             show = []
+        elif "lights" in lv:
+            show = lv["lights"]
         elif args.lights == "rules":
             show = lights.lightshow(notes, beat_times, logmel, fps, args.seed)
         else:
@@ -510,8 +570,10 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
 
     if args.replay:
         player = player or botplay.load_player(hub.player_model(), args.device)
-    if not args.no_lights and args.lights == "model":
-        lighter = lighter or lightmodel.load(hub.light_model(), args.device)
+    if not args.no_lights and args.lights == "old":
+        lighter = lighter if isinstance(lighter, lightmodel.Lighter) else lightmodel.load(hub.light_model(), args.device)
+    elif not args.no_lights and args.lights == "model":
+        lighter = lighter if isinstance(lighter, lightseq.LightSeq) else lightseq.load(hub.lightseq_model(), args.device)
     parallel = args.parallel
     if parallel is None:
         free = torch.cuda.mem_get_info()[0] / 1e9 if str(args.device).startswith("cuda") else len(stars)
@@ -543,10 +605,6 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                                                                      None if t[1] == 0 else quiet), todo, times)):
                 made[i].append(lv)
             asks = [next_asks(s, m, k, args.star_climb) for s, m in zip(stars, made)]
-            for i, (s, m) in enumerate(zip(stars, made)):
-                if asks[i] and round_ + 1 < rounds:
-                    best = min(m, key=lambda lv: abs(lv["est"] - s))
-                    log(f"{names[i]}: remaking, rated {best['est']:.1f}★ of {s:g} asked")
         levels, in_order = pick_levels(stars, made)
         if not in_order:
             log("the difficulties' ratings don't rise with their stars on this song; try another seed")
@@ -556,6 +614,11 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                     f" ({len(m)} made: " + ", ".join(f"{x['ask']:g}→{x['est']}" for x in m) + ")")
         if not args.no_lights:
             log("making the lights")
+        if not args.no_lights and args.lights == "model":
+            shows, _ = lightseq.lightshows(lighter, logmel, fps, beat_times, offset, [lv["notes"] for lv in levels], bpm,
+                                           seed=args.seed or 0, dev=args.device)
+            for lv, show in zip(levels, shows):
+                lv["lights"] = show
         levels = list(ex.map(finish, levels))
     tag = ",".join(f"{x:g}" for x in stars)
     tag += "star"

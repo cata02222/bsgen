@@ -61,7 +61,7 @@ def v2_walls(walls):
     return out
 
 
-def v3_difficulty(notes, bombs, walls, arcs, tempo_changes, lights=()):
+def v3_difficulty(notes, bombs, walls, arcs, tempo_changes, lights=(), chains=()):
     r = lambda x: round(float(x), 5)
     return {
         "version": "3.3.0",
@@ -77,7 +77,11 @@ def v3_difficulty(notes, bombs, walls, arcs, tempo_changes, lights=()):
                             "d": int(a["dir"]), "mu": float(a["mult"]), "tb": r(a["tail_beat"]), "tx": int(a["tail_line"]),
                             "ty": int(a["tail_layer"]), "tc": int(a["tail_dir"]), "tmu": float(a["tail_mult"]),
                             "m": int(a["mid"])} for a in arcs), key=lambda o: o["b"]),
-        "burstSliders": [], "waypoints": [],
+        "burstSliders": sorted(({"c": int(c["color"]), "b": r(c["beat"]), "x": int(c["line"]), "y": int(c["layer"]),
+                                 "d": int(c["dir"]), "tb": r(c["tail_beat"]), "tx": int(c["tail_line"]),
+                                 "ty": int(c["tail_layer"]), "sc": int(c["slices"]), "s": float(c["squish"])}
+                                for c in chains), key=lambda o: o["b"]),
+        "waypoints": [],
         "basicBeatmapEvents": [{"b": r(b), "et": t, "i": v, "f": 1.0} for b, t, v in lights], "colorBoostBeatmapEvents": [],
         "lightColorEventBoxGroups": [], "lightRotationEventBoxGroups": [], "lightTranslationEventBoxGroups": [],
         "vfxEventBoxGroups": [], "_fxEventsCollection": {"_fl": [], "_il": []},
@@ -126,7 +130,8 @@ def write_pack(folder: Path, audio: bytes, bpm: float, title: str, levels, tempo
     for lv in levels:
         fname = f"{lv['difficulty']}Standard.dat"
         (folder / fname).write_text(json.dumps(_difficulty(lv["notes"], lv.get("bombs"), lv.get("walls"),
-                                                           lv.get("arcs"), tempo_changes, lv.get("lights", ()), fmt)))
+                                                           lv.get("arcs"), tempo_changes, lv.get("lights", ()), fmt,
+                                                           lv.get("chains"))))
         files.append(fname)
     with zipfile.ZipFile(folder.parent / (folder.name + ".zip"), "w", zipfile.ZIP_DEFLATED) as z:
         for f in files + ["song.egg"]:
@@ -134,12 +139,13 @@ def write_pack(folder: Path, audio: bytes, bpm: float, title: str, levels, tempo
     return folder
 
 
-def _difficulty(notes, bombs, walls, arcs, tempo_changes, lights, fmt):
+def _difficulty(notes, bombs, walls, arcs, tempo_changes, lights, fmt, chains=None):
     bombs = bombs if bombs is not None else []
     walls = walls if walls is not None else []
     arcs = arcs if arcs is not None else []
-    if fmt == "v3":
-        diff = v3_difficulty(notes, bombs, walls, arcs, tempo_changes, lights)
+    chains = chains if chains is not None else []
+    if fmt == "v3" or len(chains):
+        diff = v3_difficulty(notes, bombs, walls, arcs, tempo_changes, lights, chains)
     else:
         objs = [{"_time": round(float(n["beat"]), 5), "_lineIndex": int(n["line"]), "_lineLayer": int(n["layer"]),
                  "_type": int(n["color"]), "_cutDirection": int(n["cut_dir"])} for n in notes]

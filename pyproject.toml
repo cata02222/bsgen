@@ -1,6 +1,6 @@
 [project]
 name = "bsgen"
-version = "1.3.1"
+version = "1.4.0"
 description = "Beat Saber maps from any song"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -23,7 +23,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["bsgen", "bsgen.legacy", "bsgen.legacy12"]
+packages = ["bsgen", "bsgen.legacy", "bsgen.legacy12", "bsgen.legacy13"]
 
 [tool.setuptools.package-data]
 bsgen = ["assets/*.png", "_rules.abi3.so"]

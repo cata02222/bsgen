@@ -1,5 +1,16 @@
 # Changelog
 
+**1.4** (2026-11-08)
+- new map model with chains, and Rare / Normal / Lots for arcs and chains
+- new lighting model, hears the whole song at once
+- arcs shaped more like mappers make them
+- more walls, closer to ranked maps
+- tech and speed styles lean further into their style
+- songs that can be counted at double time: the fast count for speed and Expert+, the slow one for tech
+- fewer awkward resets: no floor bombs right before an up swing
+- maps save as v3 by default, since v2 can't hold chains
+- YouTube links: the video's thumbnail as the cover when no artwork is found, and a track number in the title isn't taken for the artist
+
 **1.3.1** (2026-11-07)
 - reset bombs sit where the hand is, not off to the side
 - Stop works while the song is being read and the rhythm made

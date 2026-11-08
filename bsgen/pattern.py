@@ -161,10 +161,21 @@ def load_plan(path):
                 wander={n: tuple(float(v) for v in f["wander"][n]) for n in names})
 
 
-def make_plan(plan, tick, beat_times, offset, stars, logmel, fps, song, lift=0.0, rng=None):
+STYLE_INPUTS = ("acc", "tech", "midspeed", "speed")
+
+
+def with_style(x, styles):
+    total = sum(styles.values()) if styles else 0.0
+    cols = np.array([styles.get(s, 0.0) / total if total else 0.0 for s in STYLE_INPUTS], np.float32)
+    return np.column_stack([x, np.tile(cols, (len(x), 1))]).astype(np.float32)
+
+
+def make_plan(plan, tick, beat_times, offset, stars, logmel, fps, song, lift=0.0, rng=None, styles=None):
     x, _ = plan_rows(np.unique(tick), beat_times, offset, stars, logmel, fps, song)
     if x is None:
         return 0, None
+    if plan.get("style"):
+        x = with_style(x, styles)
     made = {}
     for name, model in plan["models"].items():
         made[name] = model.predict(x)

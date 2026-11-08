@@ -2,11 +2,12 @@ import os
 from pathlib import Path
 
 REPO = "cata121/bsgen-1.0"
-VERSIONS = ["1.3", "1.2", "1.1", "1.0"]
+VERSIONS = ["1.4", "1.3", "1.2", "1.1", "1.0"]
 NEWEST = VERSIONS[0]
-LEGACY = ("1.2", "1.1", "1.0")
+LEGACY = ("1.3", "1.2", "1.1", "1.0")
 FIXED_STARS = ("1.1", "1.0")
-MAP_NOTES = {"1.3": "newest", "1.2": "previous release", "1.1": "more creative, sometimes weird", "1.0": "first release"}
+MAP_NOTES = {"1.4": "newest", "1.3": "previous release", "1.2": "older release", "1.1": "more creative, sometimes weird",
+             "1.0": "first release"}
 
 
 def fetch(*names, version=NEWEST):
@@ -66,6 +67,15 @@ def light_model():
     if LOCAL_LIGHTS.exists():
         return LOCAL_LIGHTS
     return fetch("lights.safetensors", "lights.json")[0]
+
+
+LOCAL_LIGHTSEQ = LOCAL_MAP.with_name("lightseq.pt")
+
+
+def lightseq_model():
+    if LOCAL_LIGHTSEQ.exists():
+        return LOCAL_LIGHTSEQ
+    return fetch("lightseq.safetensors", "lightseq.json")[0]
 
 
 LOCAL_RHYTHM = LOCAL_MAP.with_name("rhythm.pt")

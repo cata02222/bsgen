@@ -9,7 +9,8 @@ import torch
 
 from . import pattern as pattern_levels
 from . import tokens
-from .tokens import CONTEXT, COND_FIELDS, MAX_MAPPERS, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, TICKS, VOCAB, WINDOW
+from .tokens import (AMOUNT_FIELDS, CONTEXT, COND_FIELDS, MAX_MAPPERS, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, TICKS, VOCAB,
+                     WINDOW)
 
 FRAMES_PER_BEAT = 12
 AHEAD = 16
@@ -35,6 +36,11 @@ SLOT_TICKS = TICKS // 6
 HIT_SLOTS = (CONTEXT + WINDOW + AHEAD) * 6
 HIT_DIM = SLOT_TICKS + 1
 REPEAT_SIM = (0.8, 0.9)
+AMOUNT_DROPOUT = 0.3
+AMOUNT_BAND = 2.0
+TEMPO_DIM = 2
+OCTAVE_SHARE = 0.25
+OCTAVE_BPM = (60.0, 300.0)
 
 
 def beat_to_sec(beat, beat_times):
@@ -86,7 +92,7 @@ def song_overview(logmel, fps, beat_times, offset):
 
 
 def overview_rel(bar, first_beat):
-    here = (first_beat + CONTEXT) // bar
+    here = int((first_beat + CONTEXT) // bar)
     return np.clip(np.arange(OVERVIEW_BARS) - here, 1 - OVERVIEW_BARS, OVERVIEW_BARS - 1) + OVERVIEW_BARS - 1
 
 
@@ -174,6 +180,84 @@ def hit_roll(ticks, t0):
     rel = rel[(rel >= 0) & (rel < HIT_SLOTS * SLOT_TICKS)]
     out[rel // SLOT_TICKS, rel % SLOT_TICKS] = 1
     return out
+
+
+def tempo_roll(beat_times, offset, t0):
+    beats = (t0 + (np.arange(HIT_SLOTS) + 0.5) * SLOT_TICKS) / TICKS + offset
+    spb = beat_to_sec(beats + 0.5, beat_times) - beat_to_sec(beats - 0.5, beat_times)
+    return np.stack([np.log2(np.maximum(spb, 1e-3) / 0.5), np.ones(HIT_SLOTS)], 1).astype(np.float32)
+
+
+def octave_shift(ev, beat_times, offset, b, up):
+    bpm = 60 / float(np.median(np.diff(beat_times)))
+    if not OCTAVE_BPM[0] <= bpm * (2 if up else 0.5) <= OCTAVE_BPM[1]:
+        return None
+    ev = ev.copy()
+    wall = ev["kind"] == tokens.WALL
+    if up:
+        ev["tick"] *= 2
+        ev["dur"][wall] *= 2
+        return ev, beat_to_sec(np.arange(2 * len(beat_times) - 1) / 2, beat_times), 2 * offset, 2 * b
+    lo, hi = 2 * (b // 2) * TICKS, 2 * (b // 2 + CONTEXT + WINDOW + AHEAD) * TICKS
+    near = ev["tick"][(ev["tick"] >= lo) & (ev["tick"] < hi)]
+    if (near % 2).any() or len(near) > MAX_TOKENS - 100:
+        return None
+    ev["tick"] //= 2
+    ev["dur"][wall] = np.maximum(ev["dur"][wall] // 2, 1)
+    return ev, beat_times[::2], offset / 2, b // 2
+
+
+def map_holds(r):
+    v = re.findall(r"\d+", str(r.get("map_version") or r.get("version") or "2"))
+    ver = tuple(int(x) for x in (v + ["0", "0"])[:2])
+    return dict(walls=True, bombs=True, arcs=ver >= (2, 6), chains=ver >= (3, 0))
+
+
+def amount_rates(r):
+    notes = max(int(r.get("notes") or 0), 1)
+    minutes = max(notes / max(float(r.get("nps") or 0), 1e-3) / 60, 0.25)
+    chains = r.get("chains", r.get("n_chains")) or 0
+    return dict(walls=(r.get("walls") or 0) / minutes, bombs=(r.get("bombs") or 0) / minutes,
+                arcs=(r.get("arcs") or 0) / notes, chains=chains / notes)
+
+
+def amount_edges(rows):
+    seen = {(r["hash"], r.get("diff")): r for r in rows if r.get("stars") is not None}
+    out = {}
+    for f in AMOUNT_FIELDS:
+        pts = [(r["stars"], amount_rates(r)[f]) for r in seen.values() if map_holds(r)[f] and amount_rates(r)[f] > 0]
+        st, v = np.array(pts).T if pts else (np.zeros(0), np.zeros(0))
+        whole = np.percentile(v, [100 / 3, 200 / 3]).tolist() if len(v) else [0.0, 0.0]
+        bands = []
+        for k in range(int(16 // AMOUNT_BAND)):
+            sel = (st >= k * AMOUNT_BAND) & (st < (k + 1) * AMOUNT_BAND)
+            bands.append(np.percentile(v[sel], [100 / 3, 200 / 3]).tolist() if sel.sum() >= 30 else whole)
+        out[f] = bands
+    return out
+
+
+def load_chains(root, spec):
+    out = {}
+    for part in filter(None, spec.split(",")):
+        for p in sorted(Path(root).glob(part)) if "*" in part else [Path(root) / part]:
+            if p.is_dir():
+                rows = [json.loads(line) for line in open(p / "rows.jsonl")]
+                with np.load(p / "notes.npz") as z:
+                    c, start = z["chains"], z["chains_start"]
+                for j, r in enumerate(rows):
+                    if start[j + 1] > start[j]:
+                        out[f"{r['hash']}/{r['diff']}"] = c[start[j]:start[j + 1]]
+            else:
+                with np.load(p) as z:
+                    out.update({k: z[k] for k in z.files})
+    return out
+
+
+def row_amounts(r, edges):
+    holds, rates = map_holds(r), amount_rates(r)
+    band = int(np.clip((r.get("stars") or 0) // AMOUNT_BAND, 0, len(edges[AMOUNT_FIELDS[0]]) - 1))
+    return {f: None if not holds[f] else 0 if rates[f] <= 0 else 1 + int(np.searchsorted(edges[f][band], rates[f]))
+            for f in AMOUNT_FIELDS}
 
 
 def mapper_key(r):
@@ -404,7 +488,9 @@ def split(index_path: Path, val_share=0.05, seed=0, per_map=3):
             [r for r in kept if song_key(r) in val and r.get("source") != LABELLED])
 
 
-def star_weights(stars, power=0.5, step=1.0):
+def star_weights(stars, power=0.5, step=1.0, top=None):
     band = np.floor(np.asarray(stars) / step).astype(int)
+    if top is not None:
+        band = np.minimum(band, int(top // step))
     _, inv, count = np.unique(band, return_inverse=True, return_counts=True)
     return count[inv].astype(np.float64) ** -power

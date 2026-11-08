@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .data import FRAMES_PER_BEAT, HIT_DIM, MAX_TOKENS, MEM_SLOTS, N_FRAMES, OVERVIEW_BARS, ROLL_DIM
+from .data import FRAMES_PER_BEAT, HIT_DIM, MAX_TOKENS, MEM_SLOTS, N_FRAMES, OVERVIEW_BARS, ROLL_DIM, TEMPO_DIM
 from .pattern import PATTERN_DIM
 from .tokens import COND_FIELDS, CONTEXT
 
@@ -30,7 +30,7 @@ class ConvBlock(nn.Module):
 class Generator(nn.Module):
     def __init__(self, vocab: int, d=384, enc_layers=6, dec_layers=6, heads=6, n_mels=80, dropout=0.1,
                  max_tokens=MAX_TOKENS, conv_blocks=0, global_cond=False, memory=False, mem_align=False,
-                 per_beat=FRAMES_PER_BEAT, hits=False, pattern=False):
+                 per_beat=FRAMES_PER_BEAT, hits=False, pattern=False, tempo=False):
         super().__init__()
         self.per_beat = per_beat
         s = per_beat // 6
@@ -60,6 +60,11 @@ class Generator(nn.Module):
             self.pat_in = nn.Linear(PATTERN_DIM, d)
             nn.init.zeros_(self.pat_in.weight)
             nn.init.zeros_(self.pat_in.bias)
+        self.tempo = tempo
+        if tempo:
+            self.tempo_in = nn.Linear(TEMPO_DIM, d)
+            nn.init.zeros_(self.tempo_in.weight)
+            nn.init.zeros_(self.tempo_in.bias)
         layer = lambda: dict(d_model=d, nhead=heads, dim_feedforward=4 * d, dropout=dropout,
                              activation="gelu", batch_first=True, norm_first=True)
         self.enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(**layer()), enc_layers, enable_nested_tensor=False)
@@ -92,6 +97,9 @@ class Generator(nn.Module):
     def encode(self, mel, overview, rel, *rest):
         mem_mel, roll, sim = rest[:3] if self.memory else (None, None, None)
         x = self.frames(mel)
+        if self.tempo:
+            x = x + self.tempo_in(rest[-1])
+            rest = rest[:-1]
         if self.pattern:
             x = x + self.pat_in(rest[-1])
             rest = rest[:-1]

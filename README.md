@@ -41,7 +41,7 @@ python scripts/play.py --map "out/song 10star.zip" --diff ExpertPlus
 The [bsgen-1.0](https://huggingface.co/cata121/bsgen-1.0) models:
 - rhythm model: 47M parameters, picks when the notes come
 - map model: 65M parameters, ~2 hours of training, fills them in
-- lighting model: 7M parameters, the lightshow
+- lighting model: 11M parameters, the lightshow
 - player model: 38M parameters, ~1 hour on one H100
 
 Older map models are still in the menu under Expert.

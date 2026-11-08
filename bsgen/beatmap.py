@@ -1,7 +1,7 @@
 import io
 import json
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -18,6 +18,10 @@ ARC_DTYPE = np.dtype([
     ("beat", "f8"), ("color", "i1"), ("line", "i1"), ("layer", "i1"), ("dir", "i1"), ("mult", "f4"),
     ("tail_beat", "f8"), ("tail_line", "i1"), ("tail_layer", "i1"), ("tail_dir", "i1"), ("tail_mult", "f4"),
     ("mid", "i1"),
+])
+CHAIN_DTYPE = np.dtype([
+    ("beat", "f8"), ("color", "i1"), ("line", "i1"), ("layer", "i1"), ("dir", "i1"),
+    ("tail_beat", "f8"), ("tail_line", "i1"), ("tail_layer", "i1"), ("slices", "i2"), ("squish", "f4"),
 ])
 
 
@@ -65,6 +69,7 @@ class Difficulty:
     arcs: np.ndarray
     n_arcs: int
     n_chains: int
+    chains: np.ndarray = field(default_factory=lambda: np.zeros(0, CHAIN_DTYPE))
 
 
 @dataclass
@@ -145,6 +150,7 @@ def read_difficulty(z: zipfile.ZipFile, info: MapInfo, characteristic: str, diff
     changes: list[tuple[float, float]] = []
     n_arcs = n_chains = 0
     arcs: list = []
+    chains: list = []
     if version.startswith("2"):
         notes = [(n["_time"], n["_lineIndex"], n["_lineLayer"], n["_type"], n["_cutDirection"], 0)
                  for n in d.get("_notes", [])]
@@ -171,7 +177,9 @@ def read_difficulty(z: zipfile.ZipFile, info: MapInfo, characteristic: str, diff
         arcs = [(a.get("b", 0), a.get("c", 0), a.get("x", 0), a.get("y", 0), a.get("d", 0), a.get("mu", 1),
                  a.get("tb", 0), a.get("tx", 0), a.get("ty", 0), a.get("tc", 0), a.get("tmu", 1), a.get("m", 0))
                 for a in d.get("sliders", [])]
-        n_arcs, n_chains = len(arcs), len(d.get("burstSliders", []))
+        chains = [(c.get("b", 0), c.get("c", 0), c.get("x", 0), c.get("y", 0), c.get("d", 0), c.get("tb", 0),
+                   c.get("tx", 0), c.get("ty", 0), c.get("sc", 0), c.get("s", 1)) for c in d.get("burstSliders", [])]
+        n_arcs, n_chains = len(arcs), len(chains)
     elif version.startswith("4"):
         nd = d.get("colorNotesData", [])
         notes = []
@@ -194,7 +202,12 @@ def read_difficulty(z: zipfile.ZipFile, info: MapInfo, characteristic: str, diff
             h, t, m = nd[a.get("hi", 0)], nd[a.get("ti", 0)], ad[a.get("ai", 0)]
             arcs.append((a.get("hb", 0), h.get("c", 0), h.get("x", 0), h.get("y", 0), h.get("d", 0), m.get("m", 1),
                          a.get("tb", 0), t.get("x", 0), t.get("y", 0), t.get("d", 0), m.get("tm", 1), m.get("a", 0)))
-        n_arcs, n_chains = len(arcs), len(d.get("chains", []))
+        cd = d.get("chainsData", [])
+        for c in d.get("chains", []):
+            h, m = nd[c.get("i", 0)], cd[c.get("ci", 0)]
+            chains.append((c.get("hb", 0), h.get("c", 0), h.get("x", 0), h.get("y", 0), h.get("d", 0), c.get("tb", 0),
+                           m.get("tx", 0), m.get("ty", 0), m.get("c", 0), m.get("s", 1)))
+        n_arcs, n_chains = len(arcs), len(chains)
     else:
         raise MapError(f"unknown difficulty version {version}")
 
@@ -217,9 +230,10 @@ def read_difficulty(z: zipfile.ZipFile, info: MapInfo, characteristic: str, diff
     wall_arr["time"] = tempo.to_seconds(wall_arr["beat"]) + info.song_offset
 
     arc_arr = np.array([tuple(a) for a in sorted(arcs)], ARC_DTYPE) if arcs else np.zeros(0, ARC_DTYPE)
+    chain_arr = np.array([tuple(c) for c in sorted(chains)], CHAIN_DTYPE) if chains else np.zeros(0, CHAIN_DTYPE)
 
     return Difficulty(characteristic, difficulty, version, float(meta["njs"]), float(meta["njs_offset"]),
-                      tempo, note_arr, bomb_arr, wall_arr, arc_arr, n_arcs, n_chains)
+                      tempo, note_arr, bomb_arr, wall_arr, arc_arr, n_arcs, n_chains, chain_arr)
 
 
 def read_audio(z: zipfile.ZipFile, info: MapInfo) -> tuple[np.ndarray, int]:

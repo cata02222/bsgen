@@ -11,10 +11,11 @@ import torch
 from . import pattern as pattern_levels
 from . import tokens
 from .data import (AHEAD, HIT_SLOTS, MEM_BEATS, REPEAT_SIM, SLOT_TICKS, beat_mel, beat_prints, beat_to_sec, best_match, hit_roll, memory_input, memory_match,
-                   overview_rel, song_overview)
+                   overview_rel, song_overview, tempo_roll)
 from .model import Generator, GraphStep, SharedStep
 from .stats import off_flow
-from .tokens import ARC, BOMB, CONTEXT, NOTE, OBJ_ARCS, OBJ_BOMBS, OBJ_WALLS, SWING, TICKS, VOCAB, WALL, WINDOW
+from .tokens import (ARC, BOMB, CHAIN, CONTEXT, NOTE, OBJ_ARCS, OBJ_BOMBS, OBJ_CHAINS, OBJ_WALLS, SWING, TICKS, VOCAB, WALL,
+                     WINDOW)
 
 FOREHAND_DIRS = {0: {1, 6, 7, 3, 8}, 1: {1, 6, 7, 2, 8}}
 BACKHAND_DIRS = {0: {0, 4, 5, 2, 8}, 1: {0, 4, 5, 3, 8}}
@@ -22,14 +23,17 @@ OPENING_DIRS = {1, 6, 7, 8}
 DIR_ANGLE = {0: 180, 1: 0, 2: 270, 3: 90, 4: 225, 5: 135, 6: 315, 7: 45}
 SLIDE_TURN = 45
 SLIDE_GAP_S = 0.05
-FLOOR_STARS, FLOOR_RATES = (6.5,), (16, 128)
+FLOOR_STARS, FLOOR_RATES = (6.5,), (16, 32)
 FLOOR_EVERY = 16 * TICKS
 FLOOR_MIN_S, FLOOR_FAR_S = 0.3, 0.8
 FLOOR_CELLS = {0, 1, 2, 3}
+FLOOR_PER_MIN, FLOOR_GRACE = 0.5, 1
 FAST_S, FAST_SPAN_S = 0.25, 30.0
 FAST_STARS, FAST_CAPS = (6.5, 8.5, 11.0), (2, 3, 5, 12)
+AIR_CUE_STARS, AIR_CUE_S = (5.0, 9.0), (0.35, 1.0)
 HAND_FAST_S, HAND_FAST_SPAN_S = 0.14, 15.0
 HAND_FAST_STARS, HAND_FAST_CAPS = (4, 5, 6, 7, 8, 9, 10, 11, 13), (1, 1, 9, 16, 65, 110, 155, 209, 252)
+HAND_BUDGET_STARS, HAND_PER_MIN, HAND_GRACE = (4.0, 5.0, 5.5, 6.0, 6.5, 7.0), (0.25, 0.5, 1.0, 3.0, 6.0, np.inf), 1
 
 
 def floor_args(beat_times, stars):
@@ -41,13 +45,31 @@ def floor_args(beat_times, stars):
 def fast_args(beat_times, stars):
     spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
     cap = FAST_CAPS[int(np.searchsorted(FAST_STARS, stars, side="right"))] if stars is not None else 0
-    return cap, int(np.ceil(FAST_S / spb * TICKS)), int(FAST_SPAN_S / spb * TICKS)
+    cue = int(np.ceil(float(np.interp(stars, AIR_CUE_STARS, AIR_CUE_S)) / spb * TICKS)) if stars is not None else 0
+    return cap, int(np.ceil(FAST_S / spb * TICKS)), int(FAST_SPAN_S / spb * TICKS), cue
 
 
 def hand_args(beat_times, stars):
     spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
     cap = max(int(np.interp(stars, HAND_FAST_STARS, HAND_FAST_CAPS)), 1) if stars is not None else 0
     return cap, int(np.ceil(HAND_FAST_S / spb * TICKS)), int(HAND_FAST_SPAN_S / spb * TICKS)
+
+
+def hand_budget(stars):
+    if stars is None or stars >= HAND_BUDGET_STARS[-1]:
+        return np.inf
+    return float(np.interp(stars, HAND_BUDGET_STARS[:-1], HAND_PER_MIN[:-1]))
+
+
+def fast_hand_count(ev, gap):
+    n = 0
+    for h in (0, 1):
+        notes = np.unique(ev["tick"][(ev["kind"] == NOTE) & (ev["hand"] == h)])
+        sw = ev["tick"][(ev["kind"] == SWING) & (ev["hand"] == h) & ~ev["air"]]
+        j = np.searchsorted(notes, sw) - 1
+        ok = j >= 0
+        n += int(np.sum(sw[ok] - notes[j[ok]] < gap))
+    return n
 
 
 def slide_gap_ticks(beat_times):
@@ -212,6 +234,8 @@ HOLD, HOLD_FROM, HOLD_GROW, HOLD_MAX = 0.0, 16, 16, 3
 AIR_RATE, AIR_FROM, AIR_PUSH, AIR_MAX = 0.02, 40, 1.0, 3.0
 AIR_ANY_STARS, AIR_ANY_RATE, AIR_ANY_PUSH, AIR_ANY_MAX = 6.5, 0.003, 10.0, 8.0
 DOUBLE_SHARE, DOUBLE_FROM, DOUBLE_PUSH, DOUBLE_MAX = 0.35, 64, 2.0, 4.0
+DOUBLE_FLOOR_STARS, DOUBLE_FLOOR = [2, 5.5, 8, 10, 12.5], [0.005, 0.024, 0.049, 0.076, 0.073]
+DOUBLE_FLOOR_PUSH, DOUBLE_FLOOR_MAX = 2.0, 3.0
 RATING_STARS = [1, 3, 5, 7, 9, 11, 13, 15]
 TYPICAL_RATINGS = {"pass": [0.31, 1.36, 2.76, 4.37, 6.30, 8.41, 10.15, 10.55],
                    "acc": [3.28, 5.24, 6.82, 8.41, 9.94, 11.17, 12.04, 12.97],
@@ -242,9 +266,70 @@ def typical_ratings_for(stars, style=None, every=False):
            if every or style is not None or k == "pass"}
     return out | {"nps": float(np.interp(stars, RATING_STARS, TYPICAL_NPS))}
 ARC_PUSH = 3.0
+WALL_STARS, WALL_RATE = [3, 7, 11, 13], [40, 50, 55, 70]
+WALL_GAIN, WALL_PUSH, WALL_PULL = 2.0, 3.0, 3.0
+
+
+WALL_GROUP = True
+
+
+def group_top_p(pr, top_p, g0, g1):
+    w = pr[:, g0:g1].sum(1, keepdim=True)
+    rest = pr.clone()
+    rest[:, g0:g1] = 0
+    sp, si = torch.sort(rest, stable=True, dim=-1, descending=True)
+    ahead = (w > 0) & (w >= sp)
+    before = torch.cumsum(sp, -1) - sp + torch.where(ahead, w, torch.zeros_like(w))
+    sp[before >= top_p] = 0
+    keep = (rest * (rest > w)).sum(1, keepdim=True) < top_p
+    gp, gi = torch.sort(pr[:, g0:g1], stable=True, dim=-1, descending=True)
+    inside = (torch.cumsum(gp, -1) - gp) / w.clamp_min(1e-30)
+    gp[~keep.expand_as(gp) | (inside >= top_p)] = 0
+    out = torch.zeros_like(pr).scatter_(1, si, sp)
+    out[:, g0:g1] = torch.zeros_like(gp).scatter_(1, gi, gp)
+    return out
+
+
+def wall_rate(stars):
+    return float(np.interp(WALL_STARS[1] if stars is None else stars, WALL_STARS, WALL_RATE))
+
+
+def wall_push(have, minutes, rate):
+    if rate <= 0:
+        return 0.0
+    return float(np.clip(WALL_GAIN * np.log((rate * minutes + 1) / (have + 1)), -WALL_PULL, WALL_PUSH))
 ARC_CAP, ARC_SPAN = 0.2, 16
+ARC_PAIR_PEN, ARC_CHAIN_PEN = 2.5, 1.0
+ARC_TURN_ADJ = {0: 0.0, 45: 0.0, 90: 1.5, 135: -0.09, 180: -0.27}
+ARC_ROWS_ADJ = (0.14, 0.23, -0.46)
+ARC_SHAPE = [round((0.0 if 8 in (a, b) else ARC_TURN_ADJ[int(abs((DIR_ANGLE[b] - DIR_ANGLE[a] + 180) % 360 - 180))]) + ARC_ROWS_ADJ[r], 3)
+             for a in range(9) for b in range(9) for r in range(3)]
 ARC_MIN_P = 0.04
 ARC_LOG = None
+AMOUNT_GAIN, AMOUNT_PUSH, AMOUNT_PULL = 2.0, 3.0, 3.0
+AMOUNT_MIN_P = {"arcs": ARC_MIN_P, "chains": 0.02}
+
+
+def amount_target(edges, stars, amount):
+    from .data import AMOUNT_BAND
+    lo, hi = edges[int(np.clip((stars or 0) // AMOUNT_BAND, 0, len(edges) - 1))]
+    low, high = ((lo / 4, lo), (lo, hi), (hi, 4 * hi))[int(amount) - 1]
+    return float(np.sqrt(max(low, 1e-6) * high))
+
+
+def amount_push(have, notes, rate):
+    return float(np.clip(AMOUNT_GAIN * np.log((rate * notes + 1) / (have + 1)), -AMOUNT_PULL, AMOUNT_PUSH))
+
+
+def chain_hook(push, temp):
+    def hook(lg, rules):
+        sl = slice(VOCAB.chain0, VOCAB.chain0 + 2)
+        if push > 0:
+            near = torch.softmax(lg.float() / temp, -1)[:, sl].sum(1) >= AMOUNT_MIN_P["chains"]
+            lg[near, sl] += push
+        else:
+            lg[:, sl] += push
+    return hook
 
 
 class LoopGuard:
@@ -337,7 +422,8 @@ class Rules:
     def __init__(self, prefix_events, end_tick, swings=True, objects=OBJ_WALLS | OBJ_BOMBS | OBJ_ARCS,
                  max_loop=MAX_LOOP, behind=TICKS // 2, dry=0.0, turn=0.0, copy=None, hold=0.0, times=None,
                  double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0, vision_gap=0,
-                 slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0), hand=(0, 0, 0), air_any=0):
+                 slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0), hand=(0, 0, 0), air_any=0, double_floor=0):
+        self.double_floor = double_floor
         self.air_any = air_any
         self.end, self.swings, self.objects, self.turn, self.hold = end_tick, swings, objects, turn, hold
         self.times = None if times is None else np.asarray(times, np.int64)
@@ -349,7 +435,8 @@ class Rules:
         self.slide_gap = slide_gap
         self.floor_rate, self.floor_min, self.floor_far = floor
         self.floor_now = False
-        self.fast_cap, self.fast_gap, self.fast_span = fast
+        self.fast_cap, self.fast_gap, self.fast_span = fast[:3]
+        self.air_cue = fast[3] if len(fast) > 3 else 0
         self.fast_ticks = []
         self.hand_cap, self.hand_gap, self.hand_span = hand
         self.hand_ticks = []
@@ -380,6 +467,10 @@ class Rules:
         self.notes_now = {0: [], 1: []}
         self.prev_note = {0: NO_NOTE, 1: NO_NOTE}
         self.arc_done = {0: False, 1: False}
+        self.arc_now = {0: False, 1: False}
+        self.arc_prev = {0: False, 1: False}
+        self.arc_head = {0: None, 1: None}
+        self.chain_done = {0: False, 1: False}
         self.note_ticks, self.arc_ticks = [], []
         self.objects_now = False
         self.walls = []
@@ -411,6 +502,10 @@ class Rules:
                 self._hit()
             elif k == ARC:
                 self.arc_ticks.append(self.tick)
+                self.arc_now[h] = True
+                self.arc_head[h] = self.prev_moment[h]
+            elif k == CHAIN:
+                self.chain_done[h] = self.arc_done[h] = True
             elif k == SWING:
                 same = self.face[h] == bool(e["forehand"]) and not e["air"]
                 self._cut_swing(h, bool(e["forehand"]), bool(e["air"]))
@@ -448,6 +543,14 @@ class Rules:
             return self.tick + 1 - self.cut_tick[h] < self.fast_gap
         j = np.searchsorted(self.times, self.tick + 1)
         return j < len(self.times) and self.times[j] - self.cut_tick[h] < self.fast_gap
+
+    def cue_stop(self, h):
+        if not self.air_cue or self.owe[h] or self.tick is None or self.cut_tick[h] is None:
+            return False
+        if self.times is None:
+            return self.tick + 1 - self.cut_tick[h] < self.air_cue
+        j = np.searchsorted(self.times, self.tick + 1)
+        return j < len(self.times) and self.times[j] - self.cut_tick[h] < self.air_cue
 
     def hand_stop(self, h):
         if not self.hand_cap or self.prev_moment[h] is None or self.tick - self.prev_moment[h] >= self.hand_gap:
@@ -518,10 +621,15 @@ class Rules:
     def double_penalty(self):
         if self.moments_n < DOUBLE_FROM or self.need_note is not None or self.tick is None:
             return []
-        over = self.doubles_n / self.moments_n - DOUBLE_SHARE
-        if over <= 0:
+        share = self.doubles_n / self.moments_n
+        over = share - DOUBLE_SHARE
+        under = self.double_floor / 10000 - share
+        if over > 0:
+            amount = min(DOUBLE_PUSH * over / 0.1, DOUBLE_MAX)
+        elif under > 0:
+            amount = -min(DOUBLE_FLOOR_PUSH * under / 0.05, DOUBLE_FLOOR_MAX)
+        else:
             return []
-        amount = min(DOUBLE_PUSH * over / 0.1, DOUBLE_MAX)
         return [(VOCAB.swing(h, f, 0), amount) for h in (0, 1) if self.stack[1 - h] and not self.stack[h]
                 for f in (0, 1)]
 
@@ -535,6 +643,23 @@ class Rules:
             return []
         amount = min(push * over / 0.01, most)
         return [(VOCAB.swing(h, f, 1), amount) for h in (0, 1) if not self.owe[h] for f in (0, 1)]
+
+    def arc_penalty(self):
+        out = []
+        for h in (0, 1):
+            if self.arc_now[h]:
+                continue
+            o, p = self.arc_head[1 - h], self.prev_moment[h]
+            pair = self.arc_now[1 - h] or (o is not None and p is not None and abs(p - o) <= TICKS // 4)
+            a = ARC_PAIR_PEN if pair else 0.0
+            if self.arc_prev[h]:
+                a += ARC_CHAIN_PEN
+            if self.notes_now[h] and self.prev_note[h] != NO_NOTE:
+                p, c = self.prev_note[h], max(self.notes_now[h])
+                a -= ARC_SHAPE[(p % 9 * 9 + c % 9) * 3 + abs(p // 9 // 4 - c // 9 // 4)]
+            if a != 0.0:
+                out.append((VOCAB.arc(h), a))
+        return out
 
     def _hit(self):
         if self.hit == self.tick:
@@ -568,10 +693,13 @@ class Rules:
                     self.prev_moment[h] = self.tick
                 if self.notes_now[h]:
                     self.prev_note[h] = max(self.notes_now[h])
+            self.arc_prev = {h: self.arc_now[h] if self.notes_now[h] else self.arc_prev[h] for h in (0, 1)}
         self.notes_now = {0: [], 1: []}
         self.tick = tick
         self.cells, self.objects_now = set(), False
         self.stack, self.first_dir, self.arc_done = {0: 0, 1: 0}, {0: None, 1: None}, {0: False, 1: False}
+        self.chain_done = {0: False, 1: False}
+        self.arc_now = {0: False, 1: False}
         self.walls = [w for w in self.walls if w[1] + max(self.behind, self.wall_gap) > tick]
 
     def _add_wall(self, shape, dur):
@@ -752,7 +880,7 @@ class Rules:
                 ok[VOCAB.wall(sh)] = not (cells & bombs or lanes & notes or head == 3 or head & ~closed & 3 and closed)
         if between and not self.objects_now:
             for h in (0, 1):
-                if self.swing_tick[h] != self.tick and self.face[h] is not None and not self.fast_stop(h):
+                if self.swing_tick[h] != self.tick and self.face[h] is not None and not self.fast_stop(h) and not self.cue_stop(h):
                     ok[VOCAB.swing(h, int(not self.face[h]), 1)] = True
         if self.objects_now or between:
             return ok
@@ -762,6 +890,10 @@ class Rules:
                     <= ARC_CAP * (len(self.note_ticks) - bisect.bisect_left(self.note_ticks, since)))
             for h in (0, 1):
                 ok[VOCAB.arc(h)] = room and self.stack[h] > 0 and self.prev_moment[h] is not None and not self.arc_done[h]
+        if self.objects & OBJ_CHAINS:
+            for h in (0, 1):
+                ok[VOCAB.chain(h)] = (self.stack[h] == 1 and not self.chain_done[h] and bool(self.notes_now[h])
+                                      and self.notes_now[h][0] % 9 != 8)
         if not self.swings:
             for h in (0, 1):
                 if not self.arc_done[h]:
@@ -784,7 +916,7 @@ class Rules:
                     ok[VOCAB.swing(h, 1, 0)] = True
                 else:
                     f = int(not self.face[h])
-                    ok[VOCAB.swing(h, f, 1)] = not self.fast_stop(h)
+                    ok[VOCAB.swing(h, f, 1)] = not self.fast_stop(h) and not self.cue_stop(h)
                     ok[VOCAB.swing(h, 1 - f if self.late(h) else f, 0)] = True
             elif self.swing_tick[h] != self.tick and self.face[h] is not None:
                 ok[VOCAB.swing(h, int(not self.face[h]), 1)] = True
@@ -836,7 +968,11 @@ class Rules:
             self._hit()
         elif VOCAB.arc0 <= k < VOCAB.bomb0:
             self.arc_done[k - VOCAB.arc0] = True
+            self.arc_now[k - VOCAB.arc0] = True
+            self.arc_head[k - VOCAB.arc0] = self.prev_moment[k - VOCAB.arc0]
             self.arc_ticks.append(self.tick)
+        elif VOCAB.chain0 <= k < VOCAB.chain0 + 2:
+            self.chain_done[k - VOCAB.chain0] = self.arc_done[k - VOCAB.chain0] = True
         elif VOCAB.bomb0 <= k < VOCAB.wall0:
             self.cells.add((2, k - VOCAB.bomb0))
             self.bomb_tick[k - VOCAB.bomb0] = self.tick
@@ -861,6 +997,7 @@ def native_consts():
     if not _NATIVE_TABLES:
         _NATIVE_TABLES.update(
             wall_cells=[(sorted(c), sorted(lanes)) for c, lanes in WALL_CELLS], wall_head=list(WALL_HEAD),
+            arc_shape=[float(x) for x in ARC_SHAPE],
             durations=[int(d) for d in tokens.DURATIONS],
             dir_angle=[DIR_ANGLE[d] for d in range(8)],
             clash=[CLASH[c][o][d] for c in range(12) for o in range(12) for d in range(9)],
@@ -877,10 +1014,11 @@ def native_consts():
         variety_beats=VARIETY_BEATS, variety_notes=VARIETY_NOTES, variety_floor=VARIETY_FLOOR,
         variety_penalty=float(VARIETY_PENALTY), dry_base=float(DRY_BASE), dry_allowed=DRY_ALLOWED,
         dry_window=DRY_WINDOW, dry_grow=DRY_GROW, double_share=float(DOUBLE_SHARE), double_from=DOUBLE_FROM,
-        double_push=float(DOUBLE_PUSH), double_max=float(DOUBLE_MAX), air_rate=float(AIR_RATE),
-        air_from=AIR_FROM, air_push=float(AIR_PUSH), air_max=float(AIR_MAX), air_any_push=float(AIR_ANY_PUSH), air_any_max=float(AIR_ANY_MAX), floor_every=FLOOR_EVERY, hold_from=float(HOLD_FROM),
+        double_push=float(DOUBLE_PUSH), double_max=float(DOUBLE_MAX),
+        double_floor_push=float(DOUBLE_FLOOR_PUSH), double_floor_max=float(DOUBLE_FLOOR_MAX), air_rate=float(AIR_RATE),
+        air_from=AIR_FROM, air_push=float(AIR_PUSH), air_max=float(AIR_MAX), air_any_push=float(AIR_ANY_PUSH), air_any_max=float(AIR_ANY_MAX), arc_pair_pen=float(ARC_PAIR_PEN), arc_chain_pen=float(ARC_CHAIN_PEN), floor_every=FLOOR_EVERY, hold_from=float(HOLD_FROM),
         hold_grow=float(HOLD_GROW), hold_max=float(HOLD_MAX), obj_walls=OBJ_WALLS, obj_bombs=OBJ_BOMBS,
-        obj_arcs=OBJ_ARCS, no_note=NO_NOTE)
+        obj_arcs=OBJ_ARCS, no_note=NO_NOTE, chain0=VOCAB.chain0, kind_chain=CHAIN, obj_chains=OBJ_CHAINS)
     key = tuple(scalars.items())
     if key not in _NATIVE_CONSTS:
         slide = [_turn(_move_angle(a, c), DIR_ANGLE[d]) <= SLIDE_TURN for a in range(12) for c in range(12) for d in range(8)]
@@ -890,14 +1028,15 @@ def native_consts():
 
 def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry, turn, copy, hold, times,
                  double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0),
-                 hand=(0, 0, 0), air_any=0):
+                 hand=(0, 0, 0), air_any=0, double_floor=0):
     e = prefix_events
     return NATIVE.Rules(native_consts(), e["tick"], e["kind"], e["hand"], e["forehand"], e["air"], e["cell"],
                         e["dir"], e["shape"], e["dur"], int(end_tick), bool(swings), int(objects), int(max_loop),
                         int(behind), float(dry), float(turn), None if copy is None else (int(copy[0]), int(copy[1])),
                         float(hold), None if times is None else [int(t) for t in times], int(double_gap),
                         int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap), int(vision_gap),
-                        int(slide_gap), *(int(x) for x in floor), *(int(x) for x in fast), *(int(x) for x in hand), int(air_any))
+                        int(slide_gap), *(int(x) for x in floor), *(int(x) for x in (tuple(fast) + (0,))[:4]), *(int(x) for x in hand), int(air_any),
+                        int(double_floor))
 
 
 GRAPHS = True
@@ -991,7 +1130,7 @@ def give_graph(model, graph):
 
 @torch.no_grad()
 def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev, xtc=0.0, min_p=0.0, arc_boost=0.0,
-                  hooks=(), gen=None, rng=None, dot_bias=0.0, xtc_floor=0.0, top_bias=0.0):
+                  hooks=(), gen=None, rng=None, dot_bias=0.0, xtc_floor=0.0, top_bias=0.0, wall_push=0.0):
     n, k = len(rules), len(prefixes) - 1
     guided = cfg != 1.0 or k > 1
     use_graph = str(dev).startswith("cuda") and GRAPHS
@@ -1025,10 +1164,18 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
             first = True
             tentative = {}
 
+            push = torch.zeros(vocab)
+            push[VOCAB.wall0:VOCAB.dur0] = wall_push
+            push_dev = push.to(dev)
+
             def guide(lg):
                 if guided:
                     u = lg[k * n:]
                     lg = u + cfg * ((w if lg.device.type == "cpu" else w_dev) * (lg[:k * n].view(k, n, -1) - u)).sum(0)
+                if wall_push:
+                    fresh = torch.tensor([not VOCAB.dur0 <= rows[i][-1] < VOCAB.events_end for i in range(len(lg))],
+                                         dtype=lg.dtype)[:, None]
+                    lg = lg + (push if lg.device.type == "cpu" else push_dev) * fresh.to(lg.device)
                 return lg
 
             def launch():
@@ -1055,7 +1202,7 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                     return NATIVE.prep(rules, done.tolist(), vocab)
                 allowed = torch.from_numpy(np.stack([eos if done[i] else r.mask()[:vocab] for i, r in enumerate(rules)]))
                 pen = [(i, tok, amount) for i, r in enumerate(rules) if not done[i]
-                       for tok, amount in r.loops.penalty(r) + r.turn_penalty() + r.hold_penalty() + r.double_penalty() + r.air_penalty()]
+                       for tok, amount in r.loops.penalty(r) + r.turn_penalty() + r.hold_penalty() + r.double_penalty() + r.air_penalty() + r.arc_penalty()]
                 return allowed, pen, [r.reset_merge() for r in rules]
 
             def draw_python(lg, prepped):
@@ -1086,17 +1233,21 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                 lg[~allowed] = -float("inf")
                 pr = torch.softmax(lg / temp, -1)
                 if xtc > 0:
+                    keep = set().union(*(getattr(h, "copying", ()) for h in hooks))
                     for i, r in enumerate(rules):
-                        if not done[i] and r.need_note is not None and rng.random() < xtc:
+                        if not done[i] and r.need_note is not None and i not in keep and rng.random() < xtc:
                             top = torch.nonzero(pr[i] >= XTC_THRESHOLD)[:, 0]
                             if len(top) >= 2:
                                 pr[i, top[pr[i, top] > pr[i, top].min()]] = 0
                                 if xtc_floor:
                                     pr[i, pr[i] < xtc_floor] = 0
+                grouped = WALL_GROUP and min_p <= 0
+                if grouped:
+                    pr = group_top_p(pr, top_p, VOCAB.wall0, VOCAB.dur0)
                 sp, si = torch.sort(pr, -1, descending=True)
                 if min_p > 0:
                     sp[sp < min_p * sp[:, :1]] = 0
-                else:
+                elif not grouped:
                     sp[torch.cumsum(sp, -1) - sp >= top_p] = 0
                 cum = torch.cumsum(sp, -1)
                 pick = torch.searchsorted(cum, torch.rand(len(cum), 1, generator=gen) * cum[:, -1:]).clamp_(max=cum.shape[1] - 1)
@@ -1113,7 +1264,10 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                 lg = pending()
                 if tentative:
                     p = torch.softmax(lg / temp, -1)
-                    air = p[:, VOCAB.swing0 + 1:VOCAB.note0:2].sum(1)
+                    air = torch.zeros(len(p))
+                    for i in tentative:
+                        air[i] = (p[i, VOCAB.swing0 + 1:VOCAB.note0:2]
+                                  * torch.as_tensor(rules[i].mask()[VOCAB.swing0 + 1:VOCAB.note0:2], dtype=p.dtype)).sum()
                     obj = ((p[:, VOCAB.bomb0:VOCAB.dur0].sum(1) + air) / p[:, VOCAB.swing0:VOCAB.events_end].sum(1)).tolist()
                     back = [i for i in tentative if rng.random() >= obj[i]]
                     for i in back:
@@ -1142,10 +1296,12 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                     bp = NATIVE.adjust(st, a, temp, arc_boost, ARC_MIN_P, dot_bias, top_bias, VOCAB.note0, VOCAB.arc0)
                     for hook in hooks:
                         hook(lg, rules)
-                    cut = [xtc > 0 and not done[i] and r.need_note is not None and rng.random() < xtc
+                    keep = set().union(*(getattr(h, "copying", ()) for h in hooks))
+                    cut = [xtc > 0 and not done[i] and r.need_note is not None and i not in keep and rng.random() < xtc
                            for i, r in enumerate(rules)]
                     ks = NATIVE.finish(st, a, temp, top_p, min_p, torch.rand(len(rules), generator=gen).tolist(),
-                                       cut, XTC_THRESHOLD, xtc_floor, VOCAB.time0, VOCAB.swing0, VOCAB.EOS)
+                                       cut, XTC_THRESHOLD, xtc_floor, VOCAB.time0, VOCAB.swing0, VOCAB.EOS,
+                                       *((VOCAB.wall0, VOCAB.dur0) if WALL_GROUP else ()))
                 else:
                     ks, bp = draw_python(lg, early or prep())
                 for i, t in enumerate(ks):
@@ -1226,10 +1382,14 @@ def load_model(path, dev="cuda"):
     model = Generator(vocab, d=a["d"], enc_layers=a["layers"], dec_layers=a["layers"], heads=a["d"] // 64,
                       conv_blocks=a.get("conv_blocks", 0), global_cond=a.get("global_cond", False),
                       max_tokens=max_tokens, memory=a.get("memory", False), mem_align=a.get("mem_align", False),
-                      per_beat=a.get("per_beat", 12), hits=a.get("hits", False), pattern=a.get("pattern", False))
+                      per_beat=a.get("per_beat", 12), hits=a.get("hits", False), pattern=a.get("pattern", False),
+                      tempo=a.get("tempo", False))
     model.load_state_dict(ck["model"])
     model.controls = vocab >= VOCAB.controls_end
-    model.plan = vocab >= VOCAB.size
+    model.plan = vocab >= VOCAB.plan_end and a.get("plan", True)
+    model.chains = bool(a.get("chains"))
+    model.amounts = bool(a.get("amounts"))
+    model.amount_edges = ck.get("amount_edges")
     model.planner = None
     model.mappers = ck.get("mappers", [])
     model.dot_boost = float(ck.get("dot_boost", 0.0))
@@ -1242,10 +1402,11 @@ def load_model(path, dev="cuda"):
 
 def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, temp=0.9, top_p=0.95,
              dev="cuda", log=None, candidates=1, controls=None, styles=None, max_loop=MAX_LOOP, dry=0.0, xtc=0.0,
-             min_p=0.0, arc_boost=0.0, arc_rate=0.0, hooks=(), gen=None, rng=None, progress=None,
+             min_p=0.0, arc_boost=0.0, arc_rate=0.0, walls=None, hooks=(), gen=None, rng=None, progress=None,
              turn=TURN_PENALTY, turn_rate=TURN_RATE, typical_ratings=True, music_fit=False, off_grid=0.0, repeat=0.0,
-             steady=True, use_plan=True, plan_cfg=PLAN_CFG, hold=HOLD, times=None, floor=None, top=None, fast=None,
+             copy_notes=0.0, steady=True, use_plan=True, plan_cfg=PLAN_CFG, hold=HOLD, times=None, floor=None, top=None, fast=None,
              pattern=None):
+    steer = {}
     if gen is not None and gen.device.type != "cpu":
         gen = torch.Generator().manual_seed(gen.initial_seed())
     plan_nps = None
@@ -1267,9 +1428,24 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
         cond["stars"] = stars
         if getattr(model, "plan", False):
             cond["wnps"] = None
+        amounts = None
+        if getattr(model, "amounts", False):
+            asked_amounts, bits = dict(c.get("amounts") or {}), dict(walls=OBJ_WALLS, bombs=OBJ_BOMBS, arcs=OBJ_ARCS)
+            amounts = {f: asked_amounts.get(f, 2 if cond["objects"] & bits.get(f, 0) else 0) for f in tokens.AMOUNT_FIELDS}
+            for f, bit in bits.items():
+                if amounts[f] == 0:
+                    cond["objects"] &= ~bit
+            cond["amounts"] = amounts
         blend = {s: w / sum(styles.values()) for s, w in styles.items() if w > 0} if styles else {None: 1.0}
         conds = [dict(cond, style=s) for s in blend]
         weights, objects = list(blend.values()), cond["objects"]
+        if getattr(model, "chains", False) and (amounts or {}).get("chains"):
+            objects |= OBJ_CHAINS
+        edges = getattr(model, "amount_edges", None)
+        if amounts and edges and stars is not None:
+            steer = {f: amount_target(edges[f], stars, amounts[f]) for f in ("arcs", "chains")
+                     if f in asked_amounts and amounts.get(f) and f in edges
+                     and (f != "chains" or getattr(model, "chains", False))}
         uncond = VOCAB.none_like(cond)
     else:
         conds, weights, objects, uncond = [stars], [1.0], 0, None
@@ -1290,7 +1466,9 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     floor_row = floor_args(beat_times, stars)
     fast_row = fast_args(beat_times, stars if fast is None else fast)
     hand_row = hand_args(beat_times, stars if fast is None else fast)
+    hand_per_min = hand_budget(stars if fast is None else fast)
     air_any = int(round(AIR_ANY_RATE * 10000)) if stars is not None and stars >= AIR_ANY_STARS else 0
+    double_floor = int(round(np.interp(stars, DOUBLE_FLOOR_STARS, DOUBLE_FLOOR) * 10000)) if stars is not None and DOUBLE_FLOOR_PUSH else 0
     uncross = stars is not None and stars < UNCROSS_STARS
     swings = getattr(model, "swings", True)
     last_note = 0
@@ -1300,6 +1478,8 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     act, _ = window_activity(logmel, fps, beat_times, offset,
                              [(b + CONTEXT, min(b + CONTEXT + WINDOW, n_beats - 2)) for b in starts])
     rates = []
+    wall_goal = wall_rate(stars) if walls is None else float(walls)
+    steer_walls = bool(objects & OBJ_WALLS) and wall_goal > 0 and getattr(model, "controls", False)
     for w, b in enumerate(starts):
         t0, new0 = b * TICKS, (b + CONTEXT) * TICKS
         end = min(t0 + (CONTEXT + WINDOW) * TICKS, (n_beats - 2) * TICKS)
@@ -1314,6 +1494,8 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             audio += (hit_roll(times, t0),)
         if getattr(model, "pattern", False):
             audio += (pattern_levels.roll(*(pattern or (0, None)), t0, HIT_SLOTS, SLOT_TICKS),)
+        if getattr(model, "tempo", False):
+            audio += (tempo_roll(beat_times, offset, t0),)
         copy = None
         if dry and lo is not None:
             m, sim = memory_match(lo, b, logmel, fps, beat_times, offset)
@@ -1322,11 +1504,40 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
         window_hooks = tuple(hooks) + ((off_grid_hook(t0, flux, fps, beat_times, offset, off_grid, "cpu"),) if off_grid else ())
         rep = repeat_hook(ev, b, logmel, fps, beat_times, offset, repeat, "cpu", families) if repeat else None
         window_hooks += (rep,) if rep else ()
+        cp = copy_hook(ev, b, logmel, fps, beat_times, offset, copy_notes) if copy_notes else None
+        window_hooks += (cp,) if cp else ()
+        if "chains" in steer:
+            window_hooks += (chain_hook(amount_push(int(np.sum(ev["kind"] == CHAIN)), int(np.sum(ev["kind"] == NOTE)),
+                                                    steer["chains"]), temp),)
         planned = None if plan_nps is None else plan_nps(new0, end, beat_times, offset)
         wconds, wweights = ([dict(c, wnps=planned) for c in conds], weights) if getattr(model, "plan", False) else (conds, weights)
         if planned is not None and plan_cfg:
             wconds = wconds + [dict(c, wnps=None) for c in conds]
             wweights = [x * (1 + plan_cfg) for x in weights] + [-x * plan_cfg for x in weights]
+
+        floor_now = floor_row
+        if floor_row[0]:
+            fb = ev[ev["kind"] == BOMB]
+            ticks, counts = np.unique(fb["tick"], return_counts=True)
+            rows = sum(1 for t, n in zip(ticks, counts) if n >= 3 and np.all(fb["cell"][fb["tick"] == t] // 4 == 0))
+            have = ev["tick"][ev["kind"] == NOTE]
+            begin = (int(have.min()) if len(have) else new0) / TICKS
+            minutes = max(np.diff(beat_to_sec(np.array([begin, new0 / TICKS]) + offset, beat_times))[0], 0.0) / 60
+            if rows >= FLOOR_GRACE + FLOOR_PER_MIN * minutes:
+                floor_now = (0,) + tuple(floor_row[1:])
+        hand_now = hand_row
+        if hand_row[0] and np.isfinite(hand_per_min):
+            have = ev["tick"][ev["kind"] == NOTE]
+            begin = (int(have.min()) if len(have) else new0) / TICKS
+            minutes = max(np.diff(beat_to_sec(np.array([begin, new0 / TICKS]) + offset, beat_times))[0], 0.0) / 60
+            if fast_hand_count(ev, hand_row[1]) >= HAND_GRACE + hand_per_min * minutes:
+                hand_now = (1, hand_row[1], end + 1)
+        wall_now = 0.0
+        if steer_walls:
+            have = ev["tick"][ev["kind"] == NOTE]
+            begin = (int(have.min()) if len(have) else new0) / TICKS
+            minutes = max(np.diff(beat_to_sec(np.array([begin, new0 / TICKS]) + offset, beat_times))[0], 0.0) / 60
+            wall_now = wall_push(int(np.sum(ev["kind"] == WALL)), minutes, wall_goal)
 
         def draw(hide_objects, allow=objects):
             prev = ev[(ev["tick"] >= t0) & (ev["tick"] < new0)]
@@ -1336,17 +1547,20 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             rules = []
             for _ in range(candidates):
                 r = make_rules(ev, end, swings, allow, max_loop, behind, dry, turn_now, copy, hold, times,
-                               double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap, floor_row, fast_row, hand_row, air_any)
+                               double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap, floor_now, fast_row, hand_now, air_any,
+                               double_floor)
                 r.begin(t0, new0 - 1)
                 rules.append(r)
             boost = arc_boost
             if arc_rate > 0:
                 under = np.sum(ev["kind"] == ARC) < arc_rate * max(np.sum(ev["kind"] == NOTE), 1)
                 boost = ARC_PUSH if under else 0.0
+            if "arcs" in steer:
+                boost = amount_push(int(np.sum(ev["kind"] == ARC)), int(np.sum(ev["kind"] == NOTE)), steer["arcs"])
             new, bl = sample_window(model, audio, prefixes, wweights, rules, cfg, temp, top_p, dev, xtc, min_p, boost,
                                     window_hooks, gen, rng, dot_bias=dot_bias(temp, stars, getattr(model, "dot_boost", 0.0)),
                                     xtc_floor=xtc_floor(stars) if floor is None else floor,
-                                    top_bias=top_bias(stars) if top is None else top)
+                                    top_bias=top_bias(stars) if top is None else top, wall_push=wall_now)
             got = [tokens.decode(prefixes[1] + t, t0) for t in new]
             return [g[g["tick"] >= new0] for g in got], bl
 
@@ -1490,6 +1704,54 @@ REPEAT_FAMILY = (0.05, 0.85)
 STRAIGHT, TRIPLET = 0, 1
 
 
+COPY_BLOCK = 8
+def copy_hook(ev, b, logmel, fps, beat_times, offset, amount):
+    have = ev["tick"][ev["kind"] == NOTE]
+    if not len(have):
+        return None
+    start, lo = b + CONTEXT, int(have.min()) // TICKS
+    first = min(lo, b)
+    prints = beat_prints(logmel, fps, beat_times, offset, first, start + WINDOW - COPY_BLOCK + MEM_BEATS - first)
+    swings, notes, push = {}, {}, {}
+    for s0 in range(start, start + WINDOW, COPY_BLOCK):
+        m, sim = best_match(prints, first, s0, lo)
+        w = float(np.clip((sim - REPEAT_SIM[0]) / (REPEAT_SIM[1] - REPEAT_SIM[0]), 0, 1))
+        if m is None or w == 0:
+            continue
+        shift = (s0 - m) * TICKS
+        old = ev[(ev["tick"] >= m * TICKS) & (ev["tick"] < (m + COPY_BLOCK) * TICKS)]
+        for e in old:
+            t, h = int(e["tick"]) + shift, int(e["hand"])
+            if e["kind"] == SWING:
+                swings.setdefault(t, []).append(VOCAB.swing(h, int(e["forehand"]), int(e["air"])) - VOCAB.swing0)
+                push[t] = amount * w
+            elif e["kind"] == NOTE:
+                notes.setdefault(t, {}).setdefault(h, []).append(VOCAB.note(h, int(e["cell"]), int(e["dir"])))
+    if not notes:
+        return None
+    lo_t, hi_t = start * TICKS, (start + WINDOW) * TICKS
+    swing_bias = {t: torch.full((8,), -push[t]).index_fill_(0, torch.tensor(sw), push[t]) for t, sw in swings.items()}
+
+    def hook(lg, rules):
+        hook.copying = set()
+        for i, r in enumerate(rules):
+            t = r.tick
+            if t is None or not lo_t <= t < hi_t or r.need_dur or t not in swing_bias:
+                continue
+            hook.copying.add(i)
+            h = r.need_note
+            if h is not None:
+                if h in notes.get(t, {}):
+                    lg[i, notes[t][h]] += push[t]
+            else:
+                lg[i, VOCAB.swing0:VOCAB.swing0 + 8] += swing_bias[t]
+                more = [x for v in notes.get(t, {}).values() for x in v]
+                if more:
+                    lg[i, more] += push[t]
+    hook.copying = set()
+    return hook
+
+
 def repeat_hook(ev, b, logmel, fps, beat_times, offset, amount, dev, families):
     have = ev["tick"][ev["kind"] == NOTE]
     if not len(have):
@@ -1564,6 +1826,7 @@ RESET_BEATS, RESET_ALONE, RESET_MIN_S = 1.0, 4.0, FLOOR_MIN_S
 RESET_SWEEP, RESET_STEP_S = 0.45, 0.04
 RESET_SAME_SWING_S = 0.07
 RESET_OTHER_S = 0.2
+RESET_LEAD_S = 0.1
 
 
 def _hand_resets(notes, secs, h):
@@ -1626,7 +1889,37 @@ def reset_bombs(notes, bombs, walls, to_seconds, seed=0, cell_gap_beats=CELL_GAP
     out = out[np.argsort(out["beat"], kind="stable")]
     out = _sweep(out, notes, secs, walls, to_seconds, pairs, rng, cell_gap_beats)
     out["time"] = to_seconds(out["beat"])
+    out = _unblock_up(out, notes, secs)
     return out[np.argsort(out["beat"], kind="stable")]
+
+
+UP_CLEAR_S = 0.35
+
+
+def _unblock_up(bombs, notes, secs=None):
+    secs = notes["time"] if secs is None else secs
+    near = np.zeros(len(bombs), bool)
+    for h in (0, 1):
+        up = (notes["color"] == h) & np.isin(notes["cut_dir"], list(UP_DIRS))
+        for t, x in zip(secs[up], notes["line"][up]):
+            near |= (bombs["layer"] == 0) & (bombs["time"] > t - UP_CLEAR_S) & (bombs["time"] < t) & (np.abs(bombs["line"] - x) <= 1)
+    bombs = bombs[~near]
+    floor, tick = bombs["layer"] == 0, np.round(bombs["beat"] * TICKS).astype(np.int64)
+    ticks, counts = np.unique(tick[floor], return_counts=True)
+    rows = ticks[counts >= 3]
+    if not len(rows):
+        return bombs
+    bad = np.zeros(len(rows), bool)
+    for h in (0, 1):
+        m = notes[notes["color"] == h]
+        if len(m) < 2:
+            continue
+        b, d = np.round(m["beat"] * TICKS).astype(np.int64), m["cut_dir"]
+        for i in np.flatnonzero(np.isin(d[:-1], list(DOWN_DIRS)) & np.isin(d[1:], list(UP_DIRS)) & (b[1:] > b[:-1])):
+            bad |= (rows > b[i]) & (rows < b[i + 1])
+    if not bad.any():
+        return bombs
+    return bombs[~(floor & np.isin(tick, rows[bad]))]
 
 
 def _into_path(bombs, drop, notes, secs, walls, to_seconds, side, cell_gap_beats):
@@ -1640,6 +1933,9 @@ def _into_path(bombs, drop, notes, secs, walls, to_seconds, side, cell_gap_beats
         times = to_seconds(bombs["beat"][at])
         fits = all(_bomb_fits(notes, secs, walls, float(bombs["beat"][j]), float(t), int(c), int(bombs["layer"][j]), h,
                               cell_gap_beats) for j, t, c in zip(at, times, to))
+        fits = fits and float(secs[n] - np.min(times)) >= RESET_LEAD_S
+        cells = {(float(bombs["beat"][j]), int(c), int(bombs["layer"][j])) for j, c in zip(at, to)}
+        fits = fits and not any(all((b, c, r) in cells for r in range(3)) for b, c, _ in cells)
         if fits:
             bombs["line"][at] = to
             seen = set()

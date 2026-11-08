@@ -20,12 +20,13 @@ import gradio as gr
 from PIL import Image
 
 import generate
-from bsgen import artwork, beatmap, export, hub, lightmodel, rhythm
+from bsgen import artwork, beatmap, export, hub, lightmodel, lightseq, rhythm
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "out" / "web"
 STYLES = {"Auto": None, "Acc": "acc", "Tech": "tech", "Midspeed": "midspeed", "Speed": "speed"}
 ARCS = {"Off": None, "Rare": 0.0, "Normal": 0.025, "Lots": 0.08}
+AMOUNTS = ["Off", "Rare", "Normal", "Lots"]
 DRY, XTC = 1.0, 0.3
 RHYTHM = [f"Auto ({rhythm.AUTO_STARS:g}★ and up)" if rhythm.AUTO_STARS > 0 else "Auto (every difficulty)", "Always", "Never"]
 DIFFS = {"Easy": (3.5, "Easy"), "Normal": (4.5, "Normal"), "Hard": (5.5, "Hard"), "Expert": (7.5, "Expert"),
@@ -73,6 +74,7 @@ CSS = f"""
 #title h1 .r {{ color: {RED}; }}
 #title h1 .b {{ color: {BLUE}; }}
 #title p {{ opacity: .6; margin: 6px 0 0; }}
+.hint p {{ font-size: 13px; opacity: .65; margin: -4px 2px 4px; }}
 #no-gpu {{ color: {RED}; text-align: center; padding: 8px 0; }}
 #go, #play {{ background: linear-gradient(90deg, {RED}, {BLUE}); border: none; color: white; font-weight: 700; }}
 footer {{ display: none !important; }}
@@ -390,7 +392,7 @@ def prefetch(device):
                 state["model"] = generate.load_map_model(hub.NEWEST, None, device)
                 state["version"] = hub.NEWEST
             if state.get("lighter") is None:
-                state["lighter"] = lightmodel.load(hub.light_model(), device)
+                state["lighter"] = lightseq.load(hub.lightseq_model(), device)
 
     jobs = [models, hub.rhythm_model, hub.timing_model, hub.player_model, songstars.load]
     jobs += [functools.partial(generate.legacy_files, v) for v in hub.LEGACY]
@@ -515,7 +517,7 @@ def build(ckpt, device):
             raise gr.Error(str(e)) from None
 
     def make(song, mode, diff, count, *rest):
-        stars, (style, arcs, extras, replay, njs, bpm, first_ms, seed, mapper, fmt, title, artist, cover, version, scene, rhythm,
+        stars, (style, arcs, chains, extras, replay, njs, bpm, first_ms, seed, mapper, fmt, title, artist, cover, version, scene, rhythm,
                 song_stars) = rest[:MAX_LEVELS], rest[MAX_LEVELS:]
         if not song:
             raise gr.Error("Add a song first.")
@@ -551,7 +553,11 @@ def build(ckpt, device):
             argv += ["--njs", f"{njs:g}"]
         if STYLES[style]:
             argv += ["--style", STYLES[style]]
-        argv += ["--no-arcs"] if ARCS[arcs] is None else ["--arc-rate", f"{ARCS[arcs]:g}"]
+        if version in hub.LEGACY and not ckpt:
+            argv += ["--no-arcs"] if ARCS[arcs] is None else ["--arc-rate", f"{ARCS[arcs]:g}"]
+        else:
+            argv += ["--no-arcs"] if arcs == "Off" else ["--arc-amount", arcs.lower()]
+            argv += [] if chains == "Off" else ["--chain-amount", chains.lower()]
         for part in ("Walls", "Bombs", "Lights"):
             if part not in extras:
                 argv.append(f"--no-{part.lower()}")
@@ -599,7 +605,7 @@ def build(ckpt, device):
                     if replay:
                         player(device)
                     if "Lights" in extras and state.get("lighter") is None and version not in hub.LEGACY:
-                        state["lighter"] = lightmodel.load(hub.light_model(), device)
+                        state["lighter"] = lightseq.load(hub.lightseq_model(), device)
                     q.put(("phase", "Reading the song"))
                     result["zip"] = generate.run(args, state["model"], log=log,
                                                  progress=progress,
@@ -657,6 +663,8 @@ def build(ckpt, device):
                 auto_cover = gr.State(None)
                 mode = gr.Radio(["Difficulty", "Stars"], value="Difficulty", show_label=False, elem_id="mode")
                 diff = gr.CheckboxGroup(list(DIFFS), value=["Expert+"], show_label=False)
+                diff_note = gr.Markdown("Each difficulty's star level is picked by a model from how hard the song "
+                                        "sounds, so different songs get different stars.", elem_classes="hint")
                 song_stars = gr.State(None)
                 with gr.Group(visible=False) as star_box:
                     stars = [gr.Slider(1, 15, value=v, step=0.5, label=star_labels(1, v)[0]["label"] if i == 0 else "",
@@ -667,9 +675,12 @@ def build(ckpt, device):
                 count = gr.State(1)
                 with gr.Accordion("Options", open=False):
                     style = gr.Radio(list(STYLES), value="Auto", label="Style")
-                    arcs = gr.Radio(list(ARCS), value="Off", label="Arcs")
-                    extras = gr.CheckboxGroup(["Walls", "Bombs", "Lights"], value=["Walls", "Bombs", "Lights"], show_label=False)
-                    replay = gr.Checkbox(False, label="Also make replays")
+                    arcs = gr.Radio(AMOUNTS, value="Normal", label="Arcs")
+                    chains = gr.Radio(AMOUNTS, value="Normal", label="Chains")
+                    extras = gr.CheckboxGroup(["Walls", "Bombs", "Lights"], value=["Walls", "Bombs", "Lights"], label="Include")
+                    replay = gr.Checkbox(False, label="Also make replays",
+                                         info="The player model plays each difficulty and saves a .bsor replay "
+                                              "next to the map zip.")
                     scene = gr.Dropdown(list(SCENES), value="Auto", label="Scene")
                 with gr.Accordion("Expert", open=False):
                     with gr.Row():
@@ -679,7 +690,8 @@ def build(ckpt, device):
                         njs = gr.Textbox(label="Note speed (NJS)", placeholder="auto")
                         seed = gr.Textbox(label="Seed", placeholder="random")
                     with gr.Row():
-                        fmt = gr.Radio(["v2", "v3"], value="v2", label="Format")
+                        fmt = gr.Radio(["v2", "v3"], value="v3" if ckpt or hub.NEWEST not in hub.LEGACY else "v2", label="Format",
+                                       info="v2 holds arcs but not chains: a difficulty with chains is saved as v3.")
                         mapper = gr.Dropdown(mappers, value="Any", label="Map like", visible=len(mappers) > 1)
                     version = gr.Dropdown([f"{v} · {hub.MAP_NOTES[v]}" for v in hub.VERSIONS], value=f"{hub.NEWEST} · "
                                           f"{hub.MAP_NOTES[hub.NEWEST]}", label="Map model", visible=not ckpt)
@@ -733,11 +745,19 @@ def build(ckpt, device):
                 found = ex.submit(song_stars_of, path)
                 t, a, duration, picture = artwork.song_info(path)
                 c, a = find_cover(t, a, duration, picture)
+                if not c:
+                    from bsgen import youtube
+                    thumb = youtube.thumbnail(path)
+                    if thumb:
+                        c, a = find_cover(t, a, picture=thumb)
+                        THUMBS.add(c)
                 try:
                     by_name = found.result()
                 except Exception:
                     by_name = None
             return gr.update(visible=True), t, a, c, c, gr.update(choices=diff_choices(by_name, version)), by_name
+
+        THUMBS = set()
 
         @functools.lru_cache(64)
         def found_cover(t, a):
@@ -746,23 +766,27 @@ def build(ckpt, device):
         def renamed(t, a, c, auto):
             if c and c != auto:
                 return c, auto, a
-            c, a = found_cover(t.strip(), a.strip())
-            return c, c, a
+            new, a = found_cover(t.strip(), a.strip())
+            if not new and auto in THUMBS:
+                return auto, auto, a
+            return new, new, a
 
         for ev in (youtube_go.click, youtube_link.submit):
             ev(from_youtube, youtube_link, song, concurrency_limit=1)
         song.change(song_names, [song, version], [names, title, artist, cover, auto_cover, diff, song_stars])
         for box in (title, artist):
             box.blur(renamed, [title, artist, cover, auto_cover], [cover, auto_cover, artist])
-        mode.change(lambda m: (gr.update(visible=m == "Difficulty"), gr.update(visible=m == "Stars")), mode, [diff, star_box])
+        mode.change(lambda m: (gr.update(visible=m == "Difficulty"),) * 2 + (gr.update(visible=m == "Stars"),), mode, [diff, diff_note, star_box])
         more.click(lambda n: resize(n + 1), count, [count, *stars, more, fewer])
         fewer.click(lambda n: resize(n - 1), count, [count, *stars, more, fewer])
         for ev in [count.change] + [x.change for x in stars]:
             ev(star_labels, [count, *stars], stars, concurrency_limit=None, show_progress="hidden")
-        go.click(make, [song, mode, diff, count, *stars, style, arcs, extras, replay, njs, bpm, first_ms, seed, mapper, fmt, title, artist, cover, version, scene, rhythm, song_stars],
+        go.click(make, [song, mode, diff, count, *stars, style, arcs, chains, extras, replay, njs, bpm, first_ms, seed, mapper, fmt, title, artist, cover, version, scene, rhythm, song_stars],
                  [out, status, stop], js=SCROLL)
         stop.click(stopping.set)
         version.change(lambda v: gr.update(visible=v.split()[0] == hub.NEWEST), version, rhythm)
+        version.change(lambda v: gr.update(visible=v.split()[0] not in hub.LEGACY), version, chains)
+        version.change(lambda v: gr.update(value="v2" if v.split()[0] in hub.LEGACY else "v3"), version, fmt)
         version.change(lambda v, b: gr.update(choices=diff_choices(b, v)), [version, song_stars], diff)
         map_zip.change(pick_levels, map_zip, play_diffs)
         play_go.click(play, [map_zip, play_diffs, height, play_seed], [play_out, play_status])

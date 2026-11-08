@@ -55,11 +55,40 @@ def _title(url):
         return None
 
 
+def thumbnail(path):
+    import io
+    import requests
+    from PIL import Image
+    m = re.fullmatch(r"youtube_([\w-]{11})\.\w+", Path(path).name)
+    if not m:
+        return None
+    for size in ("maxresdefault", "hqdefault"):
+        try:
+            r = requests.get(f"https://i.ytimg.com/vi/{m.group(1)}/{size}.jpg", timeout=15)
+            if r.status_code != 200:
+                continue
+            with Image.open(io.BytesIO(r.content)) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                if h > w * 0.7:
+                    h = round(w * 9 / 16)
+                    im = im.crop((0, (im.size[1] - h) // 2, w, (im.size[1] + h) // 2))
+                s = min(w, h)
+                im = im.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+                out = io.BytesIO()
+                im.save(out, "PNG")
+                return out.getvalue()
+        except (requests.RequestException, OSError):
+            continue
+    return None
+
+
 def song_tags(info):
     title = (info.get("track") or info.get("title") or "").strip()
     artist = (info.get("artist") or info.get("creator") or "").split(",")[0].strip()
     if not artist and not info.get("track"):
         channel = re.sub(r"\s*-\s*Topic$|VEVO$", "", info.get("uploader") or info.get("channel") or "").strip()
+        title = re.sub(r"^\s*\d{1,3}\s*[-.)]\s*(?=\D)", "", title)
         left, dash, right = title.partition(" - ")
         if dash and right.strip():
             artist, title = left.strip(), right.strip()

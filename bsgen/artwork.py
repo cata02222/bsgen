@@ -68,6 +68,8 @@ def song_info(path):
         tags = {k.lower(): v for s in streams[:1] for k, v in s.get("tags", {}).items()}
         tags |= {k.lower(): v for k, v in data.get("format", {}).get("tags", {}).items()}
         title, artist = tags.get("title") or title, tags.get("artist") or ""
+        if re.fullmatch(r"\s*\d{1,3}\s*", artist):
+            artist = ""
         tagged_title = bool(tags.get("title"))
         duration = float(data.get("format", {}).get("duration", 0)) or None
         stream = next((s for s in data.get("streams", [])
@@ -80,6 +82,8 @@ def song_info(path):
                 capture_output=True, check=True, timeout=15).stdout
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
+    if not tagged_title:
+        title = re.sub(r"^\s*(?:\d{1,3}\s*[-.)]|0\d\s)\s*(?=\D)", "", title)
     if not artist and " - " in title:
         artist, title = title.split(" - ", 1)
     if not tagged_title:
@@ -155,11 +159,14 @@ def _bare(title):
     return re.sub(r"[(\[][^)\]]*[)\]]", "", title).strip() or title
 
 
+NO_ARTIST_S = 1.0
+
+
 def pick(found, title, artist="", duration=None):
     want = _bare(title)
     ok = [f for f in found if _similar(want, _bare(f[0])) >= 0.85 and f[3]]
     if duration and not artist:
-        ok = [f for f in ok if f[2] and abs(f[2] - duration) <= 3]
+        ok = [f for f in ok if f[2] and abs(f[2] - duration) <= NO_ARTIST_S]
     if artist:
         ok = [f for f in ok if _similar(artist, f[1]) >= 0.85 or _normal(f[1]) in _normal(artist)
               or _normal(artist) in _normal(f[1])]

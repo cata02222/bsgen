@@ -199,7 +199,7 @@ def repeat_blocks(cells, mel, n_beats, thr):
 
 def lightshow(model, logmel, fps, beat_times, offset, notes, env="DefaultEnvironment", busy=None, fade=None,
               seed=0, steps=12, temp=0.9, order="random", min_p=0.0, noise=0.0, dev="cuda", same_colour=False, repeat=0.0,
-              calm=0, calm_from=0.5, follow=0.0, step_beats=None):
+              calm=0, calm_from=0.5, follow=0.0, step_beats=None, plan=None):
     from .data import beat_mel
     if not len(notes):
         return []
@@ -232,6 +232,11 @@ def lightshow(model, logmel, fps, beat_times, offset, notes, env="DefaultEnviron
             z = float(inten[b:b + hop // TICKS_PER_BEAT].mean()) if b < len(inten) else 0.0
             bw = int(np.clip(round(busy + follow * z), 0, len(BUSY_EDGES)))
             fw = 0 if z > 0.5 else 1 if z > -0.5 else len(FADE_EDGES)
+        if plan is not None:
+            lo = b + (keep // TICKS_PER_BEAT if t0 else 0)
+            pb, pf = (np.asarray(x)[lo:b + WINDOW] for x in plan)
+            if len(pb):
+                bw, fw = int(round(np.median(pb))), int(round(np.median(pf)))
         kind = [torch.tensor([bw], device=dev), torch.tensor([fw], device=dev)]
         x = torch.full((1, T, CHANNELS), MASK, dtype=torch.long, device=dev)
         if t0:
