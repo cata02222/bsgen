@@ -9,6 +9,7 @@
 - more doubles, like human maps
 - stars come more from the rhythm, less from extra-hard patterns
 - maps stop when the song fades out
+- the Auto scene picks every scene equally often
 - replays: chain links get cut
 
 **1.4** (2026-11-08)

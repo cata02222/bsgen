@@ -22,13 +22,11 @@ OTHER = len(ENVS)
 AUTO_ENVS = ["DefaultEnvironment", "BigMirrorEnvironment", "NiceEnvironment", "PanicEnvironment",
              "TriangleEnvironment", "DragonsEnvironment", "KaleidoscopeEnvironment", "BTSEnvironment",
              "OriginsEnvironment", "FitBeatEnvironment"]
-AUTO_SHOWS = [7994, 1252, 511, 367, 322, 266, 163, 159, 157, 147]
 
 
 def auto_env(seed, song=""):
     import zlib
-    p = np.array(AUTO_SHOWS, float); p /= p.sum()
-    return AUTO_ENVS[np.random.default_rng([seed, zlib.crc32(song.encode())]).choice(len(AUTO_ENVS), p=p)]
+    return AUTO_ENVS[np.random.default_rng([seed, zlib.crc32(song.encode())]).choice(len(AUTO_ENVS))]
 
 
 def channel_value(event_type, value):
