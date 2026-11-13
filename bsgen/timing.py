@@ -65,26 +65,31 @@ def _score(act, period, lo, hi, bins=None):
     return float(val[j]), (j + 0.5) / bins * period
 
 
-def _refine(act, period, phase, lo, hi):
+PEAK_REACH = 0.05
+
+
+def _peaks(act, beats, period, fps):
+    r = max(1, int(min(period / 4, PEAK_REACH * fps)))
+    pos, height = np.array(beats, np.float64), np.zeros(len(beats))
+    for i, c in enumerate(beats):
+        m = int(round(c))
+        a, b = max(m - r, 0), min(m + r + 1, len(act))
+        seg = act[a:b]
+        if len(seg) < 3:
+            continue
+        j = int(np.argmax(seg))
+        if 0 < j < len(seg) - 1:
+            d = seg[j - 1] - 2 * seg[j] + seg[j + 1]
+            pos[i] = a + j + (0.5 * (seg[j - 1] - seg[j + 1]) / d if d < 0 else 0.0)
+            height[i] = seg[j]
+    return pos, height
+
+
+def _refine(act, period, phase, lo, hi, fps):
     for _ in range(3):
         k = np.arange(np.ceil((lo - phase) / period), np.floor((hi - 1 - phase) / period) + 1)
-        g = phase + k * period
-        r = max(1, int(period / 4))
-        idx, wts = [], []
-        for c in g:
-            a, b = max(int(c) - r, 0), min(int(c) + r + 1, len(act))
-            seg = act[a:b]
-            if len(seg) < 3:
-                idx.append(c), wts.append(0.0)
-                continue
-            j = int(np.argmax(seg))
-            if 0 < j < len(seg) - 1:
-                d = seg[j - 1] - 2 * seg[j] + seg[j + 1]
-                off = 0.5 * (seg[j - 1] - seg[j + 1]) / d if d < 0 else 0.0
-            else:
-                off = 0.0
-            idx.append(a + j + off), wts.append(float(seg[j]))
-        idx, wts = np.array(idx), np.array(wts) ** 2
+        idx, wts = _peaks(act, phase + k * period, period, fps)
+        wts = wts ** 2
         if wts.sum() <= 0 or len(k) < 4:
             break
         A = np.stack([k, np.ones_like(k)], 1) * np.sqrt(wts)[:, None]
@@ -118,12 +123,12 @@ def _fit_from(act, fps, lo, hi, centre, seg, steps):
             if s > best[0]:
                 best = (s, p0 * (1 + rel), ph)
     s, period, phase = best
-    period, phase = _refine(act, period, phase, slo, shi)
+    period, phase = _refine(act, period, phase, slo, shi, fps)
     a, b = slo, shi
     while a > lo or b < hi:
         w = b - a
         a, b = max(lo, a - w // 2), min(hi, b + w // 2)
-        period, phase = _refine(act, period, phase, a, b)
+        period, phase = _refine(act, period, phase, a, b, fps)
     return period, phase % period, s
 
 
@@ -191,18 +196,15 @@ def octave_class(trees, x):
     return int(trees["classes"][np.argmax(forest_raw(trees, x))])
 
 
-def _shift(act, period, phase, lo, hi):
+def _shift(act, period, phase, lo, hi, fps):
     k = np.arange(np.ceil((lo - phase) / period), np.floor((hi - 1 - phase) / period) + 1)
-    r = max(1, int(period / 4))
-    offs, wts = [], []
-    for c in phase + k * period:
-        a, b = max(int(c) - r, 0), min(int(c) + r + 1, len(act))
-        seg = act[a:b]
-        if len(seg) < 3:
-            continue
-        j = int(np.argmax(seg))
-        offs.append(a + j - c), wts.append(float(seg[j]) ** 2)
-    return phase + float(np.average(offs, weights=wts)) if sum(wts) > 0 else phase
+    beats = phase + k * period
+    pos, height = _peaks(act, beats, period, fps)
+    wts = height ** 2
+    return phase + float(np.average(pos - beats, weights=wts)) if wts.sum() > 0 else phase
+
+
+ZERO_NEAR = 0.010
 
 
 def first_beat(act, fps, bpm, seg_sec=40.0):
@@ -215,18 +217,15 @@ def first_beat(act, fps, bpm, seg_sec=40.0):
     cands = [(fit_first * fps + m * fp) % period for m in range(int(np.ceil(period / fp)) + 1)]
     phase = max(cands, key=lambda ph: _marks(act, period, ph, a, b)[0])
     while True:
-        phase = _shift(act, period, phase, a, b)
+        phase = _shift(act, period, phase, a, b, fps)
         if a <= lo and b >= hi:
             break
         w = b - a
         a, b = max(lo, a - w // 2), min(hi, b + w // 2)
     phase %= period
-    if _marks(act, period, 0.0, lo, hi)[0] >= ZERO_KEEP * _marks(act, period, phase, lo, hi)[0]:
+    if min(phase, period - phase) <= ZERO_NEAR * fps:
         return 0.0
     return phase / fps
-
-
-ZERO_KEEP = 0.6
 
 
 def _activation(logmel, root, dev):
@@ -377,7 +376,7 @@ def sections(act, fps, trees, whole=None):
     return out
 
 
-def tempo_map(secs):
+def tempo_map(secs, warp=None):
     from .beatmap import TempoMap
     secs = [tuple(x[:3]) for x in secs]
     _, bpm0, beat0 = secs[0]
@@ -390,32 +389,110 @@ def tempo_map(secs):
         n = np.floor(tm.to_beats(first) - 0.5 - offset) + offset
         gap = first - tm.to_seconds(n)
         changes += [(float(n), 60 / gap), (float(n + 1), bpm)]
-    return TempoMap(bpm0, changes), offset
+    tm = TempoMap(bpm0, changes)
+    return (_warped(tm, offset, warp) if warp else tm), offset
 
 
-def detect_tempo(logmel, fps, root, dev="cuda"):
+FOLLOW_SMOOTH = 2.0
+FOLLOW_MIN = 0.010
+FOLLOW_GAIN = 0.08
+FOLLOW_EVERY = 4
+ON_GRID = 0.015
+
+
+def _grid_beats(tm, offset, dur):
+    return np.arange(0, int(float(tm.to_beats(dur)) - offset) + 1) + offset
+
+
+def _curve(act, fps, tm, offset, passes=4, eps=0.5):
+    k = _grid_beats(tm, offset, len(act) / fps)
+    g = tm.to_seconds(k)
+    r = np.zeros(len(g))
+    cuts = [0] + [int(round(b - offset)) for b in tm.beats[2::2]] + [len(k)]
+    for _ in range(passes):
+        step = np.zeros(len(g))
+        for a, z in zip(cuts[:-1], cuts[1:]):
+            if z - a < 4:
+                continue
+            t = g[a:z]
+            b = (t + r[a:z]) * fps
+            pos, height = _peaks(act, b, float(np.median(np.diff(t))) * fps, fps)
+            w = height ** 2
+            if not (w > 0).any():
+                continue
+            near = np.exp(-0.5 * ((t[:, None] - t[None, :]) / FOLLOW_SMOOTH) ** 2)
+            step[a:z] = (near @ (w * (pos - b))) / (near @ w + eps * np.median(w[w > 0]))
+        r += step / fps
+    return g, r
+
+
+def _warped(tm, offset, warp):
+    from .beatmap import TempoMap
+    at, shift = (np.asarray(x, np.float64) for x in warp)
+    k = _grid_beats(tm, offset, at[-1] + 1e-6)
+    g = tm.to_seconds(k)
+    sec = g + np.interp(g, at, shift)
+    i0 = 0 if k[0] > 0.05 else 1
+    if len(k) < i0 + FOLLOW_EVERY + 1:
+        return tm
+    sec[i0] = g[i0]
+    idx = sorted(set(range(i0, len(k), FOLLOW_EVERY)) | {int(round(b - offset)) for b in tm.beats[1:]})
+    idx = [i for i in idx if i0 <= i < len(k)]
+    beats, secs = k[idx], sec[idx]
+    keep = np.concatenate([[True], np.diff(secs) > 0.05])
+    beats, secs = beats[keep], secs[keep]
+    changes = [(float(b), float(60 * db / ds)) for b, db, ds in zip(beats, np.diff(beats), np.diff(secs))]
+    changes.append((float(beats[-1]), float(tm.bpms[np.searchsorted(tm.beats, beats[-1], "right") - 1])))
+    return TempoMap(float(tm.bpms[0]), changes)
+
+
+def sounds_on(acc, strength, tm, offset):
+    q = tm.to_seconds(np.arange(0, float(tm.to_beats(acc[-1])) * 4 + 8) / 4 + offset % 0.25)
+    a = acc[(strength >= np.median(strength)) & (acc > q[1]) & (acc < q[-2])]
+    if not len(a):
+        return 0.0
+    j = np.clip(np.searchsorted(q, a), 1, len(q) - 1)
+    return float(np.mean(np.minimum(np.abs(q[j] - a), np.abs(a - q[j - 1])) <= ON_GRID))
+
+
+def follow(act, logmel, fps, secs):
+    from .rhythm import accents
+    tm, offset = tempo_map(secs)
+    at, shift = _curve(act, fps, tm, offset)
+    if len(at) < 2 * FOLLOW_EVERY + 2 or np.abs(shift).max() < FOLLOW_MIN:
+        return None
+    warp = [[round(float(v), 5) for v in at], [round(float(v), 5) for v in shift]]
+    acc, strength = accents(logmel, fps, strength=True)
+    if len(acc) < 40 or sounds_on(acc, strength, _warped(tm, offset, warp), offset) - sounds_on(acc, strength, tm, offset) < FOLLOW_GAIN:
+        return None
+    return warp
+
+
+FIT = 3
+
+
+def detect_tempo(logmel, fps, root, dev="cuda", follow_song=False):
     import hashlib, json
     model = Path(root) / "timing.safetensors"
-    key = hashlib.sha1(np.ascontiguousarray(logmel).tobytes() + f"{fps}|{model.stat().st_size}|{model.stat().st_mtime_ns}"
-                       .encode()).hexdigest()
+    key = hashlib.sha1(np.ascontiguousarray(logmel).tobytes()
+                       + f"{fps}|{model.stat().st_size}|{model.stat().st_mtime_ns}|{FIT}".encode()).hexdigest()
     cache = Path(root) / "tempo_cache" / f"{key}.json"
     try:
-        secs = [tuple(x) for x in json.loads(cache.read_text())]
-        if all(len(x) == 5 for x in secs):
-            return (*tempo_map(secs), secs)
-    except (OSError, ValueError):
-        pass
-    act = _activation(logmel, root, dev)
-    trees = dict(np.load(Path(root) / "octave.npz"))
-    whole = []
-    secs = sections(act, fps, trees, whole)
-    if len(secs) == 1 and not whole:
-        bpm, first, _ = fit_grid(act, fps)
-        secs = [(0.0, *(float(v) for v in _fit(act, fps, (0, len(act)), trees)))]
-    try:
-        cache.parent.mkdir(exist_ok=True)
-        cache.write_text(json.dumps([[float(v) for v in x] for x in secs]))
-    except OSError:
-        pass
-    tm, offset = tempo_map(secs)
-    return tm, offset, secs
+        kept = json.loads(cache.read_text())
+        secs, warp = [tuple(x) for x in kept["secs"]], kept["warp"]
+    except (OSError, ValueError, KeyError, TypeError):
+        act = _activation(logmel, root, dev)
+        trees = dict(np.load(Path(root) / "octave.npz"))
+        whole = []
+        secs = sections(act, fps, trees, whole)
+        if len(secs) == 1 and not whole:
+            secs = [(0.0, *(float(v) for v in _fit(act, fps, (0, len(act)), trees)))]
+        warp = follow(act, logmel, fps, secs)
+        try:
+            cache.parent.mkdir(exist_ok=True)
+            cache.write_text(json.dumps({"secs": [[float(v) for v in x] for x in secs], "warp": warp}))
+        except OSError:
+            pass
+    if follow_song:
+        return (*tempo_map(secs, warp), secs, warp)
+    return (*tempo_map(secs), secs)

@@ -2,11 +2,11 @@ import os
 from pathlib import Path
 
 REPO = "cata121/bsgen-1.0"
-VERSIONS = ["1.4", "1.3", "1.2", "1.1", "1.0"]
+VERSIONS = ["1.5", "1.4", "1.3", "1.2", "1.1", "1.0"]
 NEWEST = VERSIONS[0]
-LEGACY = ("1.3", "1.2", "1.1", "1.0")
+LEGACY = ("1.4", "1.3", "1.2", "1.1", "1.0")
 FIXED_STARS = ("1.1", "1.0")
-MAP_NOTES = {"1.4": "newest", "1.3": "previous release", "1.2": "older release", "1.1": "more creative, sometimes weird",
+MAP_NOTES = {"1.5": "newest", "1.4": "previous release", "1.3": "older release", "1.2": "older release", "1.1": "more creative, sometimes weird",
              "1.0": "first release"}
 
 

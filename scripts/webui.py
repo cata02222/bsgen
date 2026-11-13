@@ -187,6 +187,8 @@ class Stopped(Exception):
     pass
 
 
+NO_CHAINS = ("1.3", "1.2", "1.1", "1.0")
+
 def lead_in(song, folder):
     import librosa
     import numpy as np
@@ -553,7 +555,7 @@ def build(ckpt, device):
             argv += ["--njs", f"{njs:g}"]
         if STYLES[style]:
             argv += ["--style", STYLES[style]]
-        if version in hub.LEGACY and not ckpt:
+        if version in NO_CHAINS and not ckpt:
             argv += ["--no-arcs"] if ARCS[arcs] is None else ["--arc-rate", f"{ARCS[arcs]:g}"]
         else:
             argv += ["--no-arcs"] if arcs == "Off" else ["--arc-amount", arcs.lower()]
@@ -785,8 +787,8 @@ def build(ckpt, device):
                  [out, status, stop], js=SCROLL)
         stop.click(stopping.set)
         version.change(lambda v: gr.update(visible=v.split()[0] == hub.NEWEST), version, rhythm)
-        version.change(lambda v: gr.update(visible=v.split()[0] not in hub.LEGACY), version, chains)
-        version.change(lambda v: gr.update(value="v2" if v.split()[0] in hub.LEGACY else "v3"), version, fmt)
+        version.change(lambda v: gr.update(visible=v.split()[0] not in NO_CHAINS), version, chains)
+        version.change(lambda v: gr.update(value="v2" if v.split()[0] in NO_CHAINS else "v3"), version, fmt)
         version.change(lambda v, b: gr.update(choices=diff_choices(b, v)), [version, song_stars], diff)
         map_zip.change(pick_levels, map_zip, play_diffs)
         play_go.click(play, [map_zip, play_diffs, height, play_seed], [play_out, play_status])

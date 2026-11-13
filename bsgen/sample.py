@@ -1345,14 +1345,23 @@ def song_mel(y, sr):
 
 
 TAIL_DB, TAIL_GRACE = 20.0, 1.0
+FADE_DB, FADE_SECS, FADE_GRACE, FADE_BEND = 8.0, (1.5, 8.0), 0.5, 2.5
 
 
 def song_end(logmel, fps):
     from scipy.ndimage import uniform_filter1d
     power = (10 ** (np.asarray(logmel, np.float32) / 10)).sum(1)
     db = uniform_filter1d(10 * np.log10(power + 1e-10), max(int(fps), 1))
-    loud = np.flatnonzero(db >= np.percentile(db, 75) - TAIL_DB)
-    return (loud[-1] if len(loud) else len(db)) / fps + TAIL_GRACE
+    usual = np.percentile(db, 75)
+    loud = np.flatnonzero(db >= usual - TAIL_DB)
+    if not len(loud):
+        return len(db) / fps + TAIL_GRACE
+    full = np.flatnonzero(db >= usual - FADE_DB)[-1]
+    if FADE_SECS[0] <= (loud[-1] - full) / fps <= FADE_SECS[1]:
+        fall = db[full:loud[-1] + 1]
+        if np.abs(fall - np.linspace(fall[0], fall[-1], len(fall))).max() <= FADE_BEND:
+            return full / fps + FADE_GRACE
+    return loud[-1] / fps + TAIL_GRACE
 
 
 def song_start(logmel, fps):
@@ -1393,6 +1402,7 @@ def load_model(path, dev="cuda"):
     model.planner = None
     model.mappers = ck.get("mappers", [])
     model.dot_boost = float(ck.get("dot_boost", 0.0))
+    model.dot_low = ck.get("dot_low")
     model.swings = not a.get("no_swings", False)
     model = model.to(dev).eval()
     if STEP_BF16 and str(dev).startswith("cuda"):
@@ -1558,7 +1568,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             if "arcs" in steer:
                 boost = amount_push(int(np.sum(ev["kind"] == ARC)), int(np.sum(ev["kind"] == NOTE)), steer["arcs"])
             new, bl = sample_window(model, audio, prefixes, wweights, rules, cfg, temp, top_p, dev, xtc, min_p, boost,
-                                    window_hooks, gen, rng, dot_bias=dot_bias(temp, stars, getattr(model, "dot_boost", 0.0)),
+                                    window_hooks, gen, rng, dot_bias=dot_bias(temp, stars, getattr(model, "dot_boost", 0.0), getattr(model, "dot_low", None)),
                                     xtc_floor=xtc_floor(stars) if floor is None else floor,
                                     top_bias=top_bias(stars) if top is None else top, wall_push=wall_now)
             got = [tokens.decode(prefixes[1] + t, t0) for t in new]
@@ -1802,12 +1812,18 @@ DOT_TEMP = 0.2
 
 
 DOT_BOOST_STARS, DOT_BOOST = 10.0, None
+DOT_LOW_STARS, DOT_LOW = [8.0, 9.5], [1.0, 0.7]
 
 
-def dot_bias(temp, stars=None, boost=0.0):
+def dot_bias(temp, stars=None, boost=0.0, low=None):
     b = DOT_TEMP * max(temp - 0.9, 0.0) / 0.1
     boost = boost if DOT_BOOST is None else DOT_BOOST
-    return b - (boost if stars is not None and stars >= DOT_BOOST_STARS else 0.0)
+    if stars is None:
+        return b
+    if stars < DOT_BOOST_STARS:
+        xs, ys = low if low else (DOT_LOW_STARS, DOT_LOW)
+        boost = float(np.interp(stars, list(xs) + [DOT_BOOST_STARS], list(ys) + [boost])) if DOT_LOW is not None else 0.0
+    return b - boost
 
 
 def map_sampling(stars):

@@ -180,10 +180,22 @@ def make_plan(plan, tick, beat_times, offset, stars, logmel, fps, song, lift=0.0
     for name, model in plan["models"].items():
         made[name] = model.predict(x)
         if rng is not None:
-            made[name] = made[name] + rng.normal(0, plan["taste"][name]) + _wander(len(x), plan["wander"][name], rng)
+            noise = rng.normal(0, plan["taste"][name]) + _wander(len(x), plan["wander"][name], rng)
+            made[name] = made[name] + noise * (BOTH_NOISE if name == "both" else 1.0)
+    sec = np.unique(tick) // (SECTION * TICKS)
+    made["both"] = ask_both(made["both"], np.bincount(sec - sec[0], minlength=len(x))[:len(x)])
     out = np.column_stack([np.clip(made["level"] + lift, 0.0, LEVEL_MAX), np.clip(made["both"], 0.0, 1.0),
                            np.clip(made["wide"] + lift * WIDE_PER_LEVEL, 0.0, 1.0)]).astype(np.float32)
     return int(np.min(tick)) // (SECTION * TICKS), out
+
+
+BOTH_NOISE, BOTH_SHARP, BOTH_UP, BOTH_FROM = 0.0, 1.6, 0.43, 0.10
+
+
+def ask_both(both, hits):
+    mid = float((both * hits).sum() / max(hits.sum(), 1))
+    both = mid + BOTH_SHARP * (both - mid)
+    return both + BOTH_UP * np.maximum(both - BOTH_FROM, 0.0)
 
 
 def _wander(n, sizes, rng):

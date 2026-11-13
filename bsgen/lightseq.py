@@ -146,6 +146,40 @@ def show_kind(items):
     return float(np.log(moments / n + 0.1)), fade
 
 
+UNKNOWN, TOOL, COPY, HAND = range(4)
+MADE = ("unknown", "tool", "copy", "hand")
+NOT_LIKED, LIKED = 1, 2
+
+
+def made_marks(items, note_ticks=None):
+    nan = float("nan")
+    zoom = np.array([b for b, (_, _, mo) in enumerate(items) if mo[1] > 0])
+    spin = np.array([b for b, (_, _, mo) in enumerate(items) if mo[0] > 0])
+    sweep = np.array([v for _, _, mo in items for v in mo[2:] if v >= 0])
+    gaps = np.diff(spin)
+    gaps = gaps[gaps >= 2]
+    out = dict(zoom8=float((np.diff(zoom) == 8).mean()) if len(zoom) > 4 else nan,
+               spin4=float((gaps == 4).mean()) if len(gaps) > 4 else nan,
+               sweep_odd=float(np.isin(sweep, (1, 3, 5, 7)).mean()) if len(sweep) > 10 else nan, on_note=nan, note_lit=nan)
+    if note_ticks is not None:
+        nt = np.asarray(note_ticks).reshape(-1)[:len(items) * TPB] > 0
+        lit = np.zeros(len(nt), bool)
+        g = np.array([b * TPB + t for b, (w, _, _) in enumerate(items) for t in w], np.int64)
+        lit[g[g < len(nt)]] = True
+        if lit.sum() >= 20 and nt.sum() >= 20:
+            out["on_note"], out["note_lit"] = float(nt[lit].mean()), float(lit[nt].mean())
+    return out
+
+
+def made_by(items, note_ticks=None):
+    k = made_marks(items, note_ticks)
+    if k["zoom8"] >= 0.7 or (k["spin4"] >= 0.7 and k["sweep_odd"] >= 0.99):
+        return TOOL
+    if k["on_note"] >= 0.9 and k["note_lit"] >= 0.9:
+        return COPY
+    return HAND
+
+
 def rope_at(pos, dh):
     f = 1.0 / 10000 ** (torch.arange(0, dh, 2, device=pos.device).float() / dh)
     a = pos.float()[..., None] * f
@@ -154,9 +188,10 @@ def rope_at(pos, dh):
 
 class LightSeq(nn.Module):
 
-    def __init__(self, n_vocab, d=256, enc_layers=4, dec_layers=4, heads=4, dropout=0.1, stem=64):
+    def __init__(self, n_vocab, d=256, enc_layers=4, dec_layers=4, heads=4, dropout=0.1, stem=64, tags=False, whole=False):
         super().__init__()
-        self.config = dict(n_vocab=n_vocab, d=d, enc_layers=enc_layers, dec_layers=dec_layers, heads=heads, stem=stem)
+        self.config = dict(n_vocab=n_vocab, d=d, enc_layers=enc_layers, dec_layers=dec_layers, heads=heads, stem=stem, tags=tags,
+                           whole=whole)
         self.heads = heads
         self.stem = nn.Sequential(nn.Conv1d(N_IN, stem, 3, padding=1), nn.GELU(), nn.Conv1d(stem, stem, 3, padding=1), nn.GELU())
         self.beat_in = nn.Linear(AUDIO_PER_BEAT * stem + TPB * NOTE_BITS, d)
@@ -165,6 +200,9 @@ class LightSeq(nn.Module):
         self.no_busy, self.no_fade = nn.Parameter(torch.zeros(d)), nn.Parameter(torch.zeros(d))
         self.no_audio = nn.Parameter(torch.zeros(d))
         self.phase = nn.Embedding(4, d)
+        if tags:
+            self.made, self.liked = nn.Embedding(len(MADE), d), nn.Embedding(3, d)
+            nn.init.zeros_(self.made.weight); nn.init.zeros_(self.liked.weight)
         self.enc = nn.ModuleList(Block(d, heads, dropout) for _ in range(enc_layers))
         self.enc_norm = nn.LayerNorm(d)
         self.tok = nn.Embedding(n_vocab, d)
@@ -174,7 +212,7 @@ class LightSeq(nn.Module):
         self.norm = nn.LayerNorm(d)
         self.out = nn.Linear(d, n_vocab - 1)
 
-    def encode(self, frames, notes, sec, busy, fade, pad=None, no_audio=None):
+    def encode(self, frames, notes, sec, busy, fade, pad=None, no_audio=None, made=None, liked=None):
         B, T = sec.shape
         y = self.stem(frames.transpose(1, 2)).transpose(1, 2).reshape(B, T, -1)
         if no_audio is not None:
@@ -185,6 +223,8 @@ class LightSeq(nn.Module):
             x = x + torch.where(no_audio[:, None, None], self.no_audio, 0.0)
         k = self.kind_in(torch.stack([torch.nan_to_num(busy, 0.0), torch.nan_to_num(fade, 0.0)], -1))
         k = k + torch.where(torch.isnan(busy)[:, None], self.no_busy, 0.0) + torch.where(torch.isnan(fade)[:, None], self.no_fade, 0.0)
+        if self.config.get("tags") and made is not None:
+            k = k + self.made(made) + self.liked(liked if liked is not None else torch.zeros_like(made))
         x = x + k[:, None] + self.phase(torch.arange(T, device=x.device) % 4)[None]
         cs = rope_at(torch.arange(T, device=x.device)[None].expand(B, T), x.shape[-1] // self.heads)
         mask = None if pad is None else ~pad[:, None, None, :]
@@ -292,7 +332,116 @@ def generate(model, frames, notes, sec, busy=float("nan"), fade=float("nan"), te
 
 BUSY_FIT = (0.586, -0.026, 0.669, 0.094)
 FADE_USUAL = 0.93
+FADE_HAND = 0.9
+NOTE_MISS, NOTE_LIT, FLAT, IDLE, SAME_LOOK, SWAP, SWAP_MAX = 4.0, 0.9, 2.0, 2.0, 2.0, 2.0, 0.7
+AGAIN, AGAIN_MAX = 3.0, 0.8
+
+
+def rises(m, spb=0.5):
+    act, col = m["act"], m["col"]
+    up, idle = np.zeros(act.shape, bool), np.zeros(act.shape, bool)
+    decay = max(int(1.0 / spb * TPB), 1)
+    for p in range(act.shape[1]):
+        kind, at, c0 = showlang.OFF, 0, -1
+        for t in np.flatnonzero(act[:, p] != showlang.NONE):
+            since = t - 1 - at
+            if kind in (showlang.ON, showlang.TO):
+                was = 1.0
+            elif kind == showlang.FLASH:
+                was = 1.0 if since < TPB // 4 else 0.75
+            elif kind == showlang.FADE:
+                was = max(1 - since / decay, 0.0)
+            else:
+                was = 0.0
+            kind, at = act[t, p], t
+            if kind == showlang.OFF:
+                idle[t, p] = was <= 0.05
+            else:
+                up[t, p] = was <= 0.8 or col[t, p] != c0 or kind == showlang.FLASH
+                idle[t, p] = not up[t, p] and kind != showlang.FADE
+                c0 = col[t, p]
+    return up, idle
+
+
+def hits(m, notes, spb=0.5):
+    nt = np.asarray(notes).reshape(-1)[:len(m["act"])] > 0
+    k = np.flatnonzero(nt)
+    if not len(k):
+        return 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
+    a, b = k[0] // TPB * TPB, (k[-1] // TPB + 1) * TPB
+    act, col, nt = m["act"][a:b], m["col"][a:b], nt[a:b]
+    mom = (act != showlang.NONE).any(1)
+    if not mom.any():
+        return 0.0, 1.0, 0.0, 1.0, 0.0, 0.0
+    up, idle = rises(dict(act=act, col=col), spb)
+    lit = up.any(1) & nt
+    n8 = len(nt) // (8 * TPB) * 8 * TPB
+    per = nt[:n8].reshape(-1, 8 * TPB).sum(1)
+    flat = float((lit[:n8].reshape(-1, 8 * TPB).sum(1)[per >= 4] < 0.5 * per[per >= 4]).mean()) if (per >= 4).any() else 0.0
+    left, right = showlang.PLACES.index("left"), showlang.PLACES.index("right")
+    side = [(t, bool(up[t, left])) for t in np.flatnonzero(up[:, left] ^ up[:, right])]
+    turn = np.zeros(len(nt) // TPB + 1, bool)
+    for (t0, s0), (t1, s1) in zip(side, side[1:]):
+        if s0 != s1 and t1 - t0 <= 2 * TPB:
+            turn[t0 // TPB:t1 // TPB + 1] = True
+    looks = np.concatenate([act, np.where(act >= showlang.ON, col, 0)], 1)[mom]
+    beat = up[:len(nt) // TPB * TPB].reshape(len(nt) // TPB, -1)
+    again = np.zeros(len(beat), bool)
+    for k in (1, 2, 4, 8):
+        again[k:] |= (beat[k:] == beat[:-k]).all(1)
+    has = beat.any(1)
+    return (float(lit.sum() / nt.sum()), flat, float(idle.sum() / (act != showlang.NONE).sum()),
+            float(np.unique(looks, axis=0, return_counts=True)[1].max() / len(looks)), float(turn[:len(nt) // TPB].mean()),
+            float((again & has).sum() / max(has.sum(), 1)))
+
+
+ROUNDS, NOT_HAND = 3, 10.0
+LIT_MIN, LIT_MAX, LOOKS_MIN = 1.4, 3.9, 7.0
+
+
+def dull(m, notes, sec):
+    has = np.flatnonzero(np.asarray(notes).reshape(len(notes), -1).any(1))
+    if not len(has):
+        return False
+    a, b = has[0] * TPB, (has[-1] + 1) * TPB
+    act = m["act"][a:b]
+    looks = {(tuple(x), tuple(c)) for x, c in zip(act.tolist(), m["col"][a:b].tolist()) if any(x)}
+    if len(looks) < LOOKS_MIN * (has[-1] + 1 - has[0]) / 100:
+        return True
+    spb = float(np.exp(np.mean(sec[has[0]:has[-1] + 1])))
+    return not LIT_MIN <= float(showlang.brightness(dict(act=act), spb).sum(1).mean()) <= LIT_MAX
+
+
+END_LIT, END_AT = 0.5, 0.6
+
+
+def left_on(m):
+    act = m["act"]
+    out = []
+    for p in range(act.shape[1]):
+        k = np.flatnonzero(act[:, p])
+        if len(k) and act[k[-1], p] in (showlang.ON, showlang.FLASH, showlang.TO):
+            out.append(p)
+    return out
+
+
+def fade_end(m, last):
+    on = left_on(m)
+    if not on:
+        return m
+    act, col = m["act"], m["col"]
+    n = len(act) // TPB
+    at = max(int(round(last + END_AT * (n - last))), int(np.flatnonzero(act.any(1))[-1]) // TPB + 1)
+    t = min(at, n - 1) * TPB
+    for p in on:
+        k = int(np.flatnonzero(act[:, p])[-1])
+        act[max(t, k), p], col[max(t, k), p] = showlang.FADE, col[k, p]
+    return m
+
+
+COUNT_GROUPS = 8
 TRIES = 4
+TRIES_HAND = 8
 
 
 def busy_for(notes, bpm):
@@ -302,7 +451,8 @@ def busy_for(notes, bpm):
 
 
 @torch.no_grad()
-def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, seed=0, dev="cuda", keep=1024, graph=True):
+def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, seed=0, dev="cuda", keep=1024, graph=True,
+                   made=UNKNOWN, liked=0, grouped=False):
     vocab = model.vocab
     notes = np.asarray(notes)
     R, T = notes.shape[0], len(sec)
@@ -315,7 +465,7 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
     bz = torch.tensor(np.asarray(busy, np.float32), device=dev)
     fd = torch.tensor(np.asarray(fade, np.float32), device=dev)
     with ac():
-        mem, _ = model.encode(f, nt, s, bz, fd)
+        mem, _ = model.encode(f, nt, s, bz, fd, made=torch.full((R,), made, device=dev), liked=torch.full((R,), liked, device=dev))
     H = model.heads
     dh = mem.shape[-1] // H
     mem_cs = rope_at(torch.arange(T, device=dev)[None].expand(R, T), dh)
@@ -336,6 +486,10 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
     empty = vocab.index[WHAT].get(tuple((showlang.NONE, 0) for _ in range(5)))
     if empty is not None:
         bias[WHAT, vocab.base[WHAT] + empty] = -float("inf")
+    grp = torch.zeros(n_out, dtype=torch.long, device=dev)
+    grp[vocab.base[WHEN]:vocab.base[WHEN] + len(vocab.when)] = torch.tensor([min(len(p), COUNT_GROUPS - 1) for p in vocab.when], device=dev)
+    gids = torch.arange(COUNT_GROUPS, device=dev)
+    tp = torch.tensor([float(x) for x in (top_p if isinstance(top_p, (tuple, list)) else (top_p,) * 3)], device=dev)
     wl = torch.tensor([len(p) for p in vocab.when], device=dev)
     wt = torch.tensor([list(p) + [0] * (TPB - len(p)) for p in vocab.when], device=dev)
     maxlen = T * (TPB + 2)
@@ -370,8 +524,17 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
             logits = model.out(model.norm(x[:, 0])).float()
         p = torch.softmax(logits / temp + bias[kind], -1)
         sp, si = torch.sort(p, -1, descending=True)
-        c = sp.cumsum(-1)
-        sp = sp.masked_fill(c - sp > top_p, 0)
+        if grouped:
+            gs = grp[si]
+            oh = gs[:, None, :] == gids[None, :, None]
+            cg = torch.where(oh, sp[:, None, :], 0.0).cumsum(-1)
+            own = cg.gather(1, gs[:, None, :])[:, 0]
+            mass = cg[:, :, -1].gather(1, gs)
+            kept = sp.masked_fill(own - sp > tp[kind][:, None] * mass, 0)
+            left = torch.where(oh, kept[:, None, :], 0.0).sum(-1).gather(1, gs)
+            sp = kept * mass / left.clamp(min=1e-12)
+        else:
+            sp = sp.masked_fill(sp.cumsum(-1) - sp > tp[kind][:, None], 0)
         c = sp.cumsum(-1)
         u = torch.rand(R, 1, device=dev) * c[:, -1:]
         tok = si.gather(1, (c < u).sum(-1, keepdim=True).clamp(max=n_out - 1))[:, 0]
@@ -440,13 +603,68 @@ def song_rows(logmel, fps, beat_times, offset, n_beats):
     return frames, sec
 
 
-def lightshows(model, logmel, fps, beat_times, offset, notes_list, bpm, seed=0, dev="cuda", tries=TRIES, temp=1.0,
-               top_p=0.95):
+GUIDE_MIN, GUIDE_STARS = 0.70, 8.0
+
+
+def thin(notes, offset):
+    b = np.unique(np.floor(np.asarray(notes["beat"], np.float64) - offset + 1e-6).astype(int))
+    return len(b) / max(int(b[-1] - b[0]) + 1, 1) < GUIDE_MIN if len(b) else False
+
+
+def guide_notes(beats, first, last):
+    b = np.unique(np.asarray(beats, np.float64))
+    b = b[(b >= first) & (b <= last)]
+    out = np.zeros(len(b), [("beat", "f8"), ("color", "i1")])
+    out["beat"], out["color"] = b, np.arange(len(b)) % 2
+    return out
+
+
+OUTRO_MIN, OUTRO_FADE, OUTRO_PLACES = 4.0, 2.0, 2
+
+
+def hold_outro(events, last, to, spb):
+    if (to - last) * spb < OUTRO_MIN:
+        return events
+    lights = set(showlang.BASIC_PLACE)
+    ev = sorted((e for e in events if not (e[0] > last + 1e-6 and e[1] in lights and e[2] == 0)), key=lambda e: e[0])
+    state = {}
+    for k, e in enumerate(ev):
+        if e[1] in lights:
+            state[e[1]] = k
+    act = {p: showlang.basic_action(int(ev[k][2]))[0] for p, k in state.items()}
+    held = [p for p, a in act.items() if a in (showlang.ON, showlang.FLASH, showlang.TO)]
+    if not held:
+        fades = [p for p, a in act.items() if a == showlang.FADE]
+        if fades:
+            at = max(ev[state[p]][0] for p in fades)
+            for p in sorted((p for p in fades if ev[state[p]][0] >= at - 1.0), key=lambda p: (p != 0, p != 4, p))[:OUTRO_PLACES]:
+                k = state[p]
+                colour = showlang.basic_action(int(ev[k][2]))[1]
+                ev[k] = (ev[k][0], p, showlang.basic_value(showlang.ON, colour))
+                held.append(p)
+    out_at = round(max(to - OUTRO_FADE / spb, last + 1.0), 4)
+    for p in held:
+        colour = showlang.basic_action(int(ev[state[p]][2]))[1]
+        ev.append((out_at, p, showlang.basic_value(showlang.FADE, colour)))
+    return sorted(ev, key=lambda e: e[0])
+
+
+def lightshows(model, logmel, fps, beat_times, offset, notes_list, bpm, seed=0, dev="cuda", tries=None, temp=1.0,
+               top_p=0.95, made=HAND, liked=LIKED, busy=True, fade="usual", end=None, song_end=None, grouped=True):
     ok = [i for i, nts in enumerate(notes_list) if len(nts)]
     shows = [[] for _ in notes_list]
     if not ok:
         return shows, []
+    tags = bool(model.config.get("tags"))
+    if fade == "usual":
+        fade = FADE_HAND if tags else FADE_USUAL
+    tries = tries or (TRIES_HAND if tags else TRIES)
     n_beats = max(int(np.ceil(notes_list[i]["beat"].max() - offset)) + 4 for i in ok)
+    whole = bool(model.config.get("whole")) and song_end is not None
+    if whole:
+        end = song_end
+    if end is not None:
+        n_beats = max(n_beats, min(int(np.ceil(end - offset)), len(beat_times) - 2))
     frames, sec = song_rows(logmel, fps, beat_times, offset, n_beats)
     nb = [note_bits(notes_list[i]["beat"] - offset, notes_list[i]["color"], n_beats) for i in ok]
     want = [busy_for(x, bpm) for x in nb]
@@ -454,21 +672,42 @@ def lightshows(model, logmel, fps, beat_times, offset, notes_list, bpm, seed=0, 
     for k, (start, keep_from, keep_to) in enumerate(pieces(n_beats)):
         stop = min(start + MAX_BEATS, n_beats)
         rows = [x[start:stop] for x in nb for _ in range(tries)]
-        toks = generate_batch(model, frames[start * AUDIO_PER_BEAT:stop * AUDIO_PER_BEAT], np.stack(rows), sec[start:stop],
-                              [w for w in want for _ in range(tries)], [FADE_USUAL] * len(rows), temp=temp, top_p=top_p,
-                              seed=seed + k, dev=dev)
+        best = [None] * len(ok)
+        for r in range(ROUNDS if tags and made == HAND else 1):
+            toks = generate_batch(model, frames[start * AUDIO_PER_BEAT:stop * AUDIO_PER_BEAT], np.stack(rows), sec[start:stop],
+                                  [w if busy else float("nan") for w in want for _ in range(tries)],
+                                  [float("nan") if fade is None else fade] * len(rows), temp=temp, top_p=top_p,
+                                  seed=seed + k + 1000 * r, dev=dev, made=made, liked=liked, grouped=grouped)
+            for j in range(len(ok)):
+                for t in range(tries):
+                    m = decode_show(toks[j * tries + t], model.vocab, stop - start)
+                    items = show_items(m, stop - start)
+                    bz, fd = show_kind(items)
+                    hand = tags and made == HAND
+                    fd = 0.0 if np.isnan(fd) else fd
+                    d = abs(bz - want[j]) + (0.0 if fade is None else 0.5 * abs(fd - fade))
+                    if hand:
+                        lit, flat, idle, same, swap, again = hits(m, nb[j][start:stop], float(np.exp(np.mean(sec[start:stop]))))
+                        d += NOTE_MISS * max(NOTE_LIT - lit, 0.0) + FLAT * flat + IDLE * idle + SAME_LOOK * same - (SWAP * min(swap, SWAP_MAX) + AGAIN * min(again, AGAIN_MAX)) * min(lit / NOTE_LIT, 1.0) ** 2
+                    if hand and (made_by(items, nb[j][start:stop]) != HAND or dull(m, nb[j][start:stop], sec[start:stop])):
+                        d += NOT_HAND
+                    if whole and stop == n_beats and left_on(m):
+                        d += END_LIT
+                    if best[j] is None or d < best[j][0]:
+                        best[j] = (d, m, (bz, fd, want[j]))
+            if all(b[0] < NOT_HAND - SWAP - AGAIN for b in best):
+                break
         for j, i in enumerate(ok):
-            best = None
-            for t in range(tries):
-                m = decode_show(toks[j * tries + t], model.vocab, stop - start)
-                bz, fd = show_kind(show_items(m, stop - start))
-                d = abs(bz - want[j]) + 0.5 * abs((0.0 if np.isnan(fd) else fd) - FADE_USUAL)
-                if best is None or d < best[0]:
-                    best = (d, m, (bz, fd, want[j]))
+            if whole and stop == n_beats:
+                fade_end(best[j][1], int(np.flatnonzero(nb[j].any(1))[-1]) - start)
             lo, hi = offset + keep_from - 1e-6, offset + keep_to - 1e-6
-            shows[i] += [e for e in showlang.to_basic(best[1], offset + start) if lo <= e[0] < hi or (k == 0 and e[0] < hi)]
+            shows[i] += [e for e in showlang.to_basic(best[j][1], offset + start) if lo <= e[0] < hi or (k == 0 and e[0] < hi)]
             if k == 0:
-                kinds.append(best[2])
+                kinds.append(best[j][2])
+    if song_end is not None and not whole:
+        spb = float(np.exp(np.mean(sec[-8:])))
+        for i in ok:
+            shows[i] = hold_outro(shows[i], float(notes_list[i]["beat"].max()), song_end, spb)
     return shows, kinds
 
 

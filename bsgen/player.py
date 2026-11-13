@@ -15,16 +15,18 @@ MAX_OBJECTS = 128
 DIM = 27
 
 RED, BLUE, BOMB, WALL = 0, 1, 2, 3
+CHAIN_HEAD, CHAIN_LINK = 6, 7
 NO_DIR = 9
 UNKNOWN, JOIN, NEW_FORE, NEW_BACK = 0, 1, 2, 3
 PLAY_ACCURACY = 0.975
-OBJECT_DTYPE = np.dtype([("time", "f4"), ("end", "f4"), ("kind", "i1"), ("line", "i1"), ("layer", "i1"),
-                         ("dir", "i1"), ("width", "i1"), ("height", "i1"), ("plan", "i1")])
+OBJECT_DTYPE = np.dtype([("time", "f8"), ("end", "f8"), ("kind", "i1"), ("line", "i1"), ("layer", "i1"),
+                         ("dir", "i1"), ("width", "i1"), ("height", "i1"), ("plan", "i1"),
+                         ("offset_x", "f4"), ("offset_y", "f4"), ("scoring_type", "i1")])
 REPLAY_DTYPE = np.dtype([("start", "i8"), ("frames", "i4"), ("t0", "f8"), ("map", "i4"), ("height", "f4"),
                          ("njs", "f4"), ("stars", "f4"), ("val", "?")])
 
 
-def objects_from_map(notes, bombs, walls, beat_times, plan=None):
+def objects_from_map(notes, bombs, walls, beat_times, plan=None, chains=None, seconds=None):
     out = np.zeros(len(notes) + len(bombs) + len(walls), OBJECT_DTYPE)
     n, b = len(notes), len(bombs)
     out["time"][:n], out["end"][:n] = notes["time"], notes["time"]
@@ -40,6 +42,33 @@ def objects_from_map(notes, bombs, walls, beat_times, plan=None):
     w["end"] = np.interp(walls["beat"] + walls["duration"], np.arange(len(beat_times)), beat_times)
     w["kind"], w["line"], w["layer"], w["dir"] = WALL, walls["line"], walls["layer"], NO_DIR
     w["width"], w["height"] = walls["width"], walls["height"]
+    links = []
+    for ch in (() if chains is None else chains):
+        if seconds is None:
+            raise ValueError("chains require a beat-to-song-seconds converter")
+        head_time = float(seconds(np.array([ch["beat"]]))[0])
+        heads = (np.abs(out["time"] - head_time) < 1e-3) & (out["kind"] == ch["color"]) \
+            & (out["line"] == ch["line"]) & (out["layer"] == ch["layer"]) & (out["dir"] == ch["dir"])
+        out["scoring_type"][heads] = CHAIN_HEAD
+        n = int(ch["slices"]) - 1
+        if n < 1:
+            continue
+        u = np.arange(1, n + 1) / n
+        o = np.zeros(n, OBJECT_DTYPE)
+        o["time"] = seconds(ch["beat"] + (ch["tail_beat"] - ch["beat"]) * u)
+        o["end"] = o["time"]
+        o["kind"], o["line"], o["layer"] = ch["color"], ch["line"], ch["layer"]
+        o["dir"], o["plan"], o["scoring_type"] = 8, JOIN, CHAIN_LINK
+        tail = np.array([float(ch["tail_line"]) - ch["line"], float(ch["tail_layer"]) - ch["layer"]])
+        angle = np.radians([0, 180, -90, 90, -45, 45, -135, 135, 0][int(ch["dir"])])
+        control = np.array([np.sin(angle), np.cos(angle)]) * np.linalg.norm(tail) / 2
+        squish = float(ch["squish"]) if ch["squish"] >= 0.001 else 1.0
+        v = (u * squish)[:, None]
+        xy = 2 * (1 - v) * v * control + v * v * tail
+        o["offset_x"], o["offset_y"] = xy.T
+        links.append(o)
+    if links:
+        out = np.concatenate([out, *links])
     return out[np.argsort(out["time"], kind="stable")]
 
 
@@ -76,8 +105,8 @@ def object_features(o, t):
     times = np.zeros((MAX_OBJECTS, 2), np.float32)
     mask = np.ones(MAX_OBJECTS, bool)
     ints[:k, 0] = o["kind"]
-    ints[:k, 1] = np.clip(o["line"].astype(np.int64) + 4, 0, 11)
-    ints[:k, 2] = np.clip(o["layer"], 0, 4)
+    ints[:k, 1] = np.clip(np.rint(o["line"] + o["offset_x"]).astype(np.int64) + 4, 0, 11)
+    ints[:k, 2] = np.clip(np.rint(o["layer"] + o["offset_y"]), 0, 4)
     ints[:k, 3] = np.clip(o["dir"], 0, NO_DIR)
     ints[:k, 4] = np.clip(o["width"], 0, 7)
     ints[:k, 5] = np.clip(o["height"], 0, 7)

@@ -245,8 +245,9 @@ def write_bsor(path, meta, pos, quat, events, fps=60):
             w.floats(list(pos[f, dev]) + list(quat[f, dev]))
     w.byte(2)
     w.int(len(events))
-    for sec, x, y, c, d, kind, t, saber, before, after, dist, speed, sdir, normal in sorted(events, key=lambda e: e[6]):
-        w.int(x * 1000 + y * 100 + c * 10 + d)
+    for e in sorted(events, key=lambda e: e[6]):
+        sec, x, y, c, d, kind, t, saber, before, after, dist, speed, sdir, normal = e[:14]
+        w.int((e[14] if len(e) > 14 else 0) * 10000 + x * 1000 + y * 100 + c * 10 + d)
         w.float(t)
         w.float(sec)
         w.int(kind)

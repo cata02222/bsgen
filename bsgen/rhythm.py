@@ -414,7 +414,7 @@ def burst(ticks, beat_times, offset):
     return float((np.searchsorted(sec, sec + BURST_SECS, "left") - np.arange(len(sec))).max()) / BURST_SECS
 
 
-def accents(logmel, fps):
+def accents(logmel, fps, strength=False):
     from scipy.ndimage import maximum_filter1d, uniform_filter1d
     x = np.maximum(np.asarray(logmel, np.float32), -45.0)
     rise = uniform_filter1d(np.maximum(np.diff(x, axis=0, prepend=x[:1]), 0).sum(1), max(int(round(0.03 * fps)), 1))
@@ -422,7 +422,8 @@ def accents(logmel, fps):
     mean = uniform_filter1d(rise, span)
     std = np.sqrt(np.maximum(uniform_filter1d(rise ** 2, span) - mean ** 2, 1e-9))
     peak = rise == maximum_filter1d(rise, max(int(round(0.07 * fps)) | 1, 3))
-    return np.flatnonzero(peak & (rise > mean + 0.8 * std) & (rise > 0.12 * np.percentile(rise, 99.5))) / fps
+    i = np.flatnonzero(peak & (rise > mean + 0.8 * std) & (rise > 0.12 * np.percentile(rise, 99.5)))
+    return (i / fps, ((rise - mean) / std)[i]) if strength else i / fps
 
 
 def on_accents(ticks, marks, beat_times, offset):
@@ -435,6 +436,63 @@ def on_sound(sec, marks):
     j = np.searchsorted(marks, sec)
     near = np.minimum(np.abs(marks[np.minimum(j, len(marks) - 1)] - sec), np.abs(marks[np.maximum(j - 1, 0)] - sec))
     return float(np.mean(near <= ACCENT_S))
+
+
+OFF_WINDOW, OFF_HOP = 16.0, 4.0
+OFF_SHARE = 0.35
+OFF_MIN = 12
+SOUND_REACH = 0.06
+SOUND_NEAR = 0.02
+SOUND_GAP = 0.6
+
+
+def off_grid(acc, strength, beat_times, offset):
+    from .timing import ON_GRID
+    acc = np.asarray(acc, np.float64)
+    if len(acc) < OFF_MIN:
+        return []
+    a = acc[np.asarray(strength) >= np.median(strength)]
+    q = beat_to_sec(offset + np.arange(0, 4 * len(beat_times)) / 4, np.asarray(beat_times))
+    j = np.clip(np.searchsorted(q, a), 1, len(q) - 1)
+    on = np.minimum(np.abs(q[j] - a), np.abs(a - q[j - 1])) <= ON_GRID
+    out = []
+    for t in np.arange(0.0, max(acc[-1] - OFF_WINDOW, 0.0) + OFF_HOP, OFF_HOP):
+        m = (a >= t) & (a < t + OFF_WINDOW)
+        if m.sum() >= OFF_MIN and on[m].mean() < OFF_SHARE:
+            if out and t <= out[-1][1]:
+                out[-1][1] = t + OFF_WINDOW
+            else:
+                out.append([t, t + OFF_WINDOW])
+    return [(float(a), float(b)) for a, b in out]
+
+
+def to_sounds(ticks, acc, beat_times, offset, spans):
+    t = np.unique(np.asarray(ticks, np.int64))
+    acc = np.asarray(acc, np.float64)
+    if not len(spans) or len(t) < 2 or len(acc) < 2:
+        return t
+    bt = np.asarray(beat_times)
+    sec = beat_to_sec(t / TICKS + offset, bt)
+    j = np.clip(np.searchsorted(acc, sec), 1, len(acc) - 1)
+    j = np.where(np.abs(acc[j] - sec) < np.abs(sec - acc[j - 1]), j, j - 1)
+    d = np.abs(acc[j] - sec)
+    inside = np.zeros(len(t), bool)
+    for a, b in spans:
+        inside |= (sec >= a) & (sec < b)
+    taken = set(j[d <= SOUND_NEAR].tolist())
+    to = np.round((sec_to_beat(acc, bt) - offset) * TICKS).astype(np.int64)
+    new = t.copy()
+    for i in np.argsort(d):
+        if not inside[i] or d[i] <= SOUND_NEAR or d[i] > SOUND_REACH or int(j[i]) in taken:
+            continue
+        x = to[j[i]]
+        if i > 0 and x - new[i - 1] < max(3, np.ceil(SOUND_GAP * (t[i] - t[i - 1]))):
+            continue
+        if i + 1 < len(t) and new[i + 1] - x < max(3, np.ceil(SOUND_GAP * (t[i + 1] - t[i]))):
+            continue
+        new[i] = x
+        taken.add(int(j[i]))
+    return new
 
 
 def star_cfg(stars):

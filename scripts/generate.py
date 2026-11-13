@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import functools
 import io
 import json
 import subprocess
@@ -50,11 +51,28 @@ def next_asks(star, made, k, climb=STAR_CLIMB):
     return asks
 
 
+def more_hits(star, made, asks, cap):
+    if cap is None or not asks or abs(np.mean(asks) - star) <= cap:
+        return 0.0, asks
+    sign = 1.0 if np.mean(asks) > star else -1.0
+    edge = star + sign * cap
+    a, e = np.array([lv["ask"] for lv in made]), np.array([lv["est"] for lv in made])
+    slope, icept = np.polyfit(a, e, 1) if np.ptp(a) > 0 else (0.0, 0.0)
+    at_edge = icept + slope * edge if slope > 0.2 else float(e[np.argmin(np.abs(e - star))])
+    more = sign * float(np.clip(sign * (star - at_edge) / (HITS_UP if sign > 0 else 1.0), HITS_MIN, HITS_MAX))
+    more = max(more, 0.5 - star)
+    return more, sorted(round(float(star + sign * cap * f), 2) for f in np.linspace(0.0, 1.0, len(asks)))
+
+
 STAR_ORDER_GAP = 0.5
 PICK_OFF = 10.0
 PLAN_LIFT = 2.5
 PLAN_SPREAD = 0.8
 STYLE_PLAN_LIFT = {"tech": 3.2, "speed": -2.4, "midspeed": 0.0, "acc": 0.0}
+OFF_GRID_SOUNDS = False
+LIFT_CAP = 0.8
+HITS_MIN, HITS_MAX = 0.5, 2.5
+HITS_UP = 0.45
 RHYTHM_AT_WANTED = False
 
 
@@ -98,6 +116,7 @@ def parser():
     ap.add_argument("--cover", help="cover image to use instead of an automatic lookup")
     ap.add_argument("--bpm", type=float, help="default: detected from the audio")
     ap.add_argument("--offset-ms", type=float, help="song time of the first beat (with --bpm; default: found in the audio)")
+    ap.add_argument("--no-follow", action="store_true", help="one tempo per section, also where the song floats around it")
     ap.add_argument("--stars", type=float, nargs="+",
                     help="one difficulty per value, all in one level (e.g. --stars 4.5 7.5 10)")
     ap.add_argument("--cfg", type=float, default=1.5)
@@ -269,7 +288,12 @@ def _legacy13():
     return generate
 
 
-FROZEN = {"1.2": _legacy12, "1.3": _legacy13}
+def _legacy14():
+    from bsgen.legacy14 import generate
+    return generate
+
+
+FROZEN = {"1.2": _legacy12, "1.3": _legacy13, "1.4": _legacy14}
 
 
 def frozen_run(args, model=None, log=print, progress=None, player=None):
@@ -365,16 +389,21 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 bpm, first = timing.detect(logmel, fps, root, args.device, bpm=bpm)
                 log(f"timing: {bpm:.3f} BPM (given), first beat at {first * 1000:.0f} ms")
             else:
-                tempo, offset, secs = timing.detect_tempo(logmel, fps, root, args.device)
+                tempo, offset, secs, warp = timing.detect_tempo(logmel, fps, root, args.device, follow_song=True)
+                if args.no_follow:
+                    warp = None
+                    tempo, offset = timing.tempo_map(secs)
                 want = octave_want(args)
                 secs, changed = timing.choose_octave(secs, want)
                 if changed:
-                    tempo, offset = timing.tempo_map(secs)
+                    tempo, offset = timing.tempo_map(secs, warp)
                     log(f"timing: {want} count for the {style_name(args) or 'stars asked'}: "
                         + ", ".join(f"{a:.3f} -> {b:.3f} BPM" for _, a, b in changed))
                 bpm = secs[0][1]
                 log("timing: " + ", then ".join(f"{b:.3f} BPM" + (f" from {s:.1f} s" if s else "")
                                                 for s, b, _ in secs) + f", first beat at {secs[0][2] * 1000:.0f} ms")
+                if warp:
+                    log(f"timing: the grid follows the song ({len(tempo.bpms) - 1} small tempo steps)")
         if tempo is None:
             tempo = beatmap.TempoMap(bpm)
             offset = first * bpm / 60
@@ -474,8 +503,16 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                                  gen=rgen, ratings=ratings[0] if one else ratings, audio_cfg=args.rhythm_audio_cfg,
                                  wanted=wanted[0] if one else wanted, check=getattr(progress, "check", None))
             for j, t in zip(part, [got] if one else got):
-                out[j] = t
+                out[j] = t if t is None or not OFF_GRID_SOUNDS else rhythm.to_sounds(t, off_marks()[0], grid_times, 0.0, off_marks()[1])
         return out
+
+    @functools.lru_cache(None)
+    def off_marks():
+        acc, strength = rhythm.accents(logmel, fps, strength=True)
+        spans = rhythm.off_grid(acc, strength, grid_times, 0.0)
+        if spans:
+            log("grid doesn't hold at " + ", ".join(f"{a:.0f}-{b:.0f} s" for a, b in spans) + ": hits there go on the sounds")
+        return acc, spans
 
     def level(star, name, speed, ask, times=None, progress=progress, say=None):
         say = say or ((lambda m: log(f"{name}: {m}")) if len(stars) > 1 else log)
@@ -583,6 +620,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
     workers = max(1, min(parallel, len(stars) * k))
     with ThreadPoolExecutor(workers) as ex, sample.together(workers):
         made = [[] for _ in stars]
+        more = [0.0] * len(stars)
         asks = [first_asks(s, k, planned_model) for s in stars]
         rounds = STAR_ROUNDS if k > 1 else 1
         for round_ in range(rounds):
@@ -590,7 +628,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             if not todo:
                 break
             quiet = (lambda m: None) if k > 1 and not args.verbose else None
-            times = rhythms([(stars[i] if RHYTHM_AT_WANTED or planned_model else a, njs[i], stars[i]) for i, _, a in todo])
+            times = rhythms([(stars[i] + more[i] if RHYTHM_AT_WANTED or planned_model else a, njs[i], stars[i]) for i, _, a in todo])
             beats = {}
 
             def tick(i, j):
@@ -603,22 +641,34 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
             for (i, _, _), lv in zip(todo, ex.map(lambda t, h: level(stars[t[0]], names[t[0]], njs[t[0]], t[2], h,
                                                                      tick(t[0], t[1]),
                                                                      None if t[1] == 0 else quiet), todo, times)):
+                lv["rhythm"] = stars[i] + more[i]
                 made[i].append(lv)
             asks = [next_asks(s, m, k, args.star_climb) for s, m in zip(stars, made)]
+            if planned_model and rhythm_model is not None and not args.human_times:
+                more, asks = (list(x) for x in zip(*(more_hits(s, m, a, LIFT_CAP) for s, m, a in zip(stars, made, asks))))
         levels, in_order = pick_levels(stars, made)
         if not in_order:
             log("the difficulties' ratings don't rise with their stars on this song; try another seed")
         for s, lv, m in zip(stars, levels, made):
             if len(m) > 1:
-                log(f"{lv['difficulty']}: kept the one made at {lv['ask']:g}★, rated {lv['est']:.1f}★ of {s:g} asked"
+                log(f"{lv['difficulty']}: kept the one made at {lv['ask']:g}★" + (f" on the {lv['rhythm']:g}★ rhythm" if lv["rhythm"] != s else "")
+                    + f", rated {lv['est']:.1f}★ of {s:g} asked"
                     f" ({len(m)} made: " + ", ".join(f"{x['ask']:g}→{x['est']}" for x in m) + ")")
         if not args.no_lights:
             log("making the lights")
         if not args.no_lights and args.lights == "model":
-            shows, _ = lightseq.lightshows(lighter, logmel, fps, beat_times, offset, [lv["notes"] for lv in levels], bpm,
-                                           seed=args.seed or 0, dev=args.device)
-            for lv, show in zip(levels, shows):
-                lv["lights"] = show
+            guide = levels[int(np.argmax(stars))]["notes"]
+            if len(guide) and (max(stars) < lightseq.GUIDE_STARS or lightseq.thin(guide, offset)) and rhythm_model is not None:
+                with sample.GATE.reading():
+                    rgen = torch.Generator(device=args.device).manual_seed(args.seed or 0)
+                hits = rhythm.generate(rhythm_model, logmel, fps, grid_times, 0.0, n_beats, lightseq.GUIDE_STARS, n=1,
+                                       dev=args.device, gen=rgen)[0]
+                guide = lightseq.guide_notes(hits / rhythm.TICKS + offset, guide["beat"].min(), guide["beat"].max())
+                log(f"lights: written from a {lightseq.GUIDE_STARS:g}★ rhythm of the song ({len(guide)} hits), the hardest difficulty's notes being few")
+            shows, _ = lightseq.lightshows(lighter, logmel, fps, beat_times, offset, [guide], bpm,
+                                           seed=args.seed or 0, dev=args.device, end=end_beat, song_end=float(n_beats))
+            for lv in levels:
+                lv["lights"] = shows[0]
         levels = list(ex.map(finish, levels))
     tag = ",".join(f"{x:g}" for x in stars)
     tag += "star"

@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from .player import BLUE, DIM, RED, WALL
+from .player import BLUE, CHAIN_HEAD, CHAIN_LINK, DIM, RED, WALL, as_objects
 
 FPS = 60
 NOTE_DEPTH = 0.9
@@ -35,7 +35,9 @@ def tips(motion):
 class Notes:
 
     def __init__(self, objects, njs):
+        objects = as_objects(objects)
         n = objects[objects["kind"] <= BLUE]
+        self.scoring_type = n["scoring_type"]
         self.time = n["time"].astype(np.float64)
         self.color = n["kind"].astype(np.int64)
         self.line, self.layer = n["line"].astype(np.int64), n["layer"].astype(np.int64)
@@ -53,6 +55,7 @@ class Notes:
         self.along = np.stack([np.sin(a), np.cos(a), np.zeros_like(a)], 1).astype(np.float32)
         self.across = np.stack([np.cos(a), -np.sin(a), np.zeros_like(a)], 1).astype(np.float32)
         self.centre = np.stack([LANES[np.clip(self.line, 0, 3)], FIRST_ROW + ROW * self.layer], 1).astype(np.float32)
+        self.centre += np.stack([LANE * n["offset_x"], ROW * n["offset_y"]], 1)
 
     def __len__(self):
         return len(self.time)
@@ -270,22 +273,30 @@ def note_events(notes, motion, height):
         v = vel[f, saber]
         normal = np.cross(tip[f, saber] - h, v)
         normal /= np.linalg.norm(normal) + 1e-9
-        centre = np.array([LANES[min(max(x, 0), 3)], rows[min(max(y, 0), 2)], (sec - f / FPS) * notes.njs + 0.65])
+        centre = np.array([notes.centre[k, 0], rows[min(max(y, 0), 2)] + notes.centre[k, 1] - (FIRST_ROW + ROW * y),
+                           (sec - f / FPS) * notes.njs + 0.65])
         speed = float(np.linalg.norm(v))
         out.append((sec, x, y, c, d, kind, f / FPS, saber, float(before), float(after),
                     abs(float(normal @ (centre - h))), speed, v / (speed + 1e-9), normal))
-    return out
+    return [e + (int(notes.scoring_type[k]),) if notes.scoring_type[k] else e for k, e in enumerate(out)]
+
+
+LINK, ANY, LINK_SCORE = CHAIN_LINK, 8, 20
 
 
 def replay_score(events):
     total, mult, progress = 0, 1, 0
     for e in sorted(events, key=lambda e: e[6]):
         if e[5] == 0:
-            cut = round(70 * e[8]) + round(30 * e[9]) + round(15 * (1 - min(e[10] / 0.3, 1)))
-            total += cut * mult
+            scoring_type = e[14] if len(e) > 14 else 0
+            cut = round(70 * e[8]) + (0 if scoring_type == CHAIN_HEAD else round(30 * e[9])) \
+                + round(15 * (1 - min(e[10] / 0.3, 1)))
+            if scoring_type == LINK:
+                cut = LINK_SCORE
             progress += 1
             if mult < 8 and progress >= mult * 2:
                 mult, progress = mult * 2, 0
+            total += cut * mult
         else:
             mult, progress = max(mult // 2, 1), 0
     return total

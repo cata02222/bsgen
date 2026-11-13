@@ -1,5 +1,16 @@
 # Changelog
 
+**1.5** (2026-11-13)
+- new map model: sideways swings and dots like mappers make them, fewer crossed doubles
+- new rhythm model: busy parts follow the song, fast drops stay fast at high stars
+- new lighting model: lights come up on the notes, left and right take turns, patterns repeat like a mapper's
+- lights made about twice as fast
+- the beat grid follows the song, so fewer missing or late swings
+- more doubles, like human maps
+- stars come more from the rhythm, less from extra-hard patterns
+- maps stop when the song fades out
+- replays: chain links get cut
+
 **1.4** (2026-11-08)
 - new map model with chains, and Rare / Normal / Lots for arcs and chains
 - new lighting model, hears the whole song at once
