@@ -104,6 +104,16 @@ def _comes_through(c, o, d):
 
 
 CLASH = [[[_comes_through(c, o, d) for d in range(9)] for o in range(12)] for c in range(12)]
+
+
+def _chain_tail(c, d):
+    if d not in tokens.DIR_STEP:
+        return -1
+    x, y = c % 4 + tokens.DIR_STEP[d][0], c // 4 + tokens.DIR_STEP[d][1]
+    return y * 4 + x if 0 <= x <= 3 and 0 <= y <= 2 else -1
+
+
+CHAIN_TAIL = [[_chain_tail(c, d) for d in range(9)] for c in range(12)]
 MAX_STACK = 4
 MAX_GAP = 96
 BOMB_GAP, BOMB_GAP_RATE = 48, 0.5
@@ -141,6 +151,25 @@ def near_gap_ticks(beat_times):
 
 
 VISION_GAP_S = 0.3
+
+
+CROSS_GAP_S = 0.2
+CROSS_STARS = (2.5, 3.5, 5.5, 7.5, 9.5, 11.5, 13.5)
+CROSS_RATES = (0.017, 0.042, 0.101, 0.144, 0.193, 0.204, 0.253)
+CROSS_PRIOR, CROSS_PUSH, CROSS_MAX = 40, 1.5, 4.0
+CROSS_CELLS = {h: [c for c in range(12) if c % 4 not in HAND_COLS[h]] for h in (0, 1)}
+PAIR_STARS = (2.5, 3.5, 5.5, 7.5, 9.5, 12.5, 13.5)
+PAIR_OFF = (0.28, 0.37, 0.47, 0.55, 0.57, 0.57, 0.65)
+PAIR_CROSSED = (0.005, 0.005, 0.017, 0.034, 0.074, 0.097, 0.154)
+PAIR_PRIOR = 20
+
+
+def cross_args(beat_times, stars):
+    if stars is None or not CROSS_PUSH:
+        return 0, 0, 0, 0
+    spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
+    at = lambda v: int(round(float(np.interp(stars, CROSS_STARS if v is CROSS_RATES else PAIR_STARS, v)) * 10000))
+    return int(round(CROSS_GAP_S / spb * TICKS)), at(CROSS_RATES), at(PAIR_OFF), at(PAIR_CROSSED)
 
 
 def vision_gap_ticks(beat_times):
@@ -422,7 +451,10 @@ class Rules:
     def __init__(self, prefix_events, end_tick, swings=True, objects=OBJ_WALLS | OBJ_BOMBS | OBJ_ARCS,
                  max_loop=MAX_LOOP, behind=TICKS // 2, dry=0.0, turn=0.0, copy=None, hold=0.0, times=None,
                  double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0, vision_gap=0,
-                 slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0), hand=(0, 0, 0), air_any=0, double_floor=0):
+                 slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0), hand=(0, 0, 0), air_any=0, double_floor=0, cross=(0, 0, 0, 0)):
+        self.cross_gap, self.cross_rate, self.pair_off, self.pair_crossed = cross
+        self.notes_n = self.cross_n = 0
+        self.pairs_n = self.pairs_off = self.pairs_crossed = 0
         self.double_floor = double_floor
         self.air_any = air_any
         self.end, self.swings, self.objects, self.turn, self.hold = end_tick, swings, objects, turn, hold
@@ -459,6 +491,7 @@ class Rules:
         self.swing_tick = {0: None, 1: None}
         self.air = {0: True, 1: True}
         self.cells = set()
+        self.chain_cells = set()
         self.after_time = False
         self.opened = {0: False, 1: False}
         self.first_dir = {0: None, 1: None}
@@ -492,6 +525,7 @@ class Rules:
                     self.first_dir[h] = int(e["dir"])
                 if e["dir"] != 8:
                     self.swing_dir[h] = (int(e["dir"]), self.tick)
+                self._cross(h, int(e["cell"]))
                 self.cells.add((h, int(e["cell"])))
                 self.cell_tick[int(e["cell"])] = self.tick
                 self.cut_tick[h] = self.tick
@@ -506,6 +540,7 @@ class Rules:
                 self.arc_head[h] = self.prev_moment[h]
             elif k == CHAIN:
                 self.chain_done[h] = self.arc_done[h] = True
+                self._chain(h)
             elif k == SWING:
                 same = self.face[h] == bool(e["forehand"]) and not e["air"]
                 self._cut_swing(h, bool(e["forehand"]), bool(e["air"]))
@@ -618,6 +653,46 @@ class Rules:
         return ({c for c in cells if c != self.head[h] and _turn(_move_angle(self.head[h], c), a) <= SLIDE_TURN},
                 {d for d in dirs if d == 8 or _turn(DIR_ANGLE[d], a) <= SLIDE_TURN})
 
+    def _near(self, h):
+        o = 1 - h
+        return bool(self.stack[o]) or (self.prev_moment[o] is not None and self.tick - self.prev_moment[o] <= self.cross_gap)
+
+    def _cross(self, h, cell):
+        if not self.cross_rate:
+            return
+        self.notes_n += 1
+        self.cross_n += cell % 4 not in HAND_COLS[h] and self._near(h)
+
+    def _lanes(self, h):
+        return [x // 9 % 4 for x in self.notes_now[h]]
+
+    def cross_penalty(self):
+        if not self.cross_rate or self.tick is None:
+            return []
+        push = lambda n, k, prior, rate: max(min(CROSS_PUSH * ((n + prior * rate) / (k + prior) - rate) / 0.05, CROSS_MAX), 0.0)
+        amount = push(self.cross_n, self.notes_n, CROSS_PRIOR, self.cross_rate / 10000)
+        out = {}
+        if amount > 0:
+            for h in (0, 1):
+                if self._near(h):
+                    for c in CROSS_CELLS[h]:
+                        for d in range(9):
+                            out[VOCAB.note(h, c, d)] = amount
+        if self.notes_now[0] and self.pair_off:
+            off = push(self.pairs_off, self.pairs_n, PAIR_PRIOR, self.pair_off / 10000)
+            crossed = push(self.pairs_crossed, self.pairs_n, PAIR_PRIOR, self.pair_crossed / 10000)
+            top = max(self._lanes(0))
+            for c in range(12):
+                lane = c % 4
+                a = (off + crossed) if lane < top else off if lane <= 1 else 0.0
+                if a > 0:
+                    for d in range(9):
+                        out[VOCAB.note(1, c, d)] = out.get(VOCAB.note(1, c, d), 0.0) + a
+            if top >= 2 and off > 0 and self.swing_tick[1] != self.tick:
+                for f in (0, 1):
+                    out[VOCAB.swing(1, f, 0)] = off
+        return sorted(out.items())
+
     def double_penalty(self):
         if self.moments_n < DOUBLE_FROM or self.need_note is not None or self.tick is None:
             return []
@@ -685,6 +760,11 @@ class Rules:
 
     def _new_moment(self, tick):
         if self.tick is not None:
+            if self.pair_off and self.notes_now[0] and self.notes_now[1]:
+                left, right = self._lanes(0), self._lanes(1)
+                self.pairs_n += 1
+                self.pairs_off += not (max(left) <= 1 and min(right) >= 2)
+                self.pairs_crossed += max(left) > min(right)
             if self.stack[0] or self.stack[1]:
                 self.moments_n += 1
                 self.doubles_n += bool(self.stack[0] and self.stack[1])
@@ -696,7 +776,7 @@ class Rules:
             self.arc_prev = {h: self.arc_now[h] if self.notes_now[h] else self.arc_prev[h] for h in (0, 1)}
         self.notes_now = {0: [], 1: []}
         self.tick = tick
-        self.cells, self.objects_now = set(), False
+        self.cells, self.objects_now, self.chain_cells = set(), False, set()
         self.stack, self.first_dir, self.arc_done = {0: 0, 1: 0}, {0: None, 1: None}, {0: False, 1: False}
         self.chain_done = {0: False, 1: False}
         self.arc_now = {0: False, 1: False}
@@ -715,12 +795,21 @@ class Rules:
         return out
 
     def _free(self, behind=0, notes=False):
-        out = set(range(12)) - {c for _, c in self.cells} - self._covered(behind, notes)
+        out = set(range(12)) - {c for _, c in self.cells} - self.chain_cells - self._covered(behind, notes)
         if self.cell_gap:
             out -= {c for c, t in self.cell_tick.items() if 0 < self.tick - t < self.cell_gap}
             if notes:
                 out -= {c for c, t in self.bomb_tick.items() if 0 < self.tick - t < self.cell_gap}
         return out
+
+    def _tail(self, h):
+        x = self.notes_now[h][0] if self.notes_now[h] else None
+        return -1 if x is None else CHAIN_TAIL[x // 9][x % 9]
+
+    def _chain(self, h):
+        t = self._tail(h)
+        if t >= 0:
+            self.chain_cells.add(t)
 
     def _col(self, h, cell):
         if cell in (5, 6):
@@ -893,7 +982,7 @@ class Rules:
         if self.objects & OBJ_CHAINS:
             for h in (0, 1):
                 ok[VOCAB.chain(h)] = (self.stack[h] == 1 and not self.chain_done[h] and bool(self.notes_now[h])
-                                      and self.notes_now[h][0] % 9 != 8)
+                                      and self.notes_now[h][0] % 9 != 8 and self._tail(h) in note_free)
         if not self.swings:
             for h in (0, 1):
                 if not self.arc_done[h]:
@@ -950,6 +1039,7 @@ class Rules:
             j = k - VOCAB.note0
             h = j // 108
             self.loops.add(self.tick, h, j // 9 % 12, j % 9)
+            self._cross(h, j // 9 % 12)
             self.cut_tick[h] = self.tick
             self.notes_now[h].append(j % 108)
             self.cells.add((h, j // 9 % 12))
@@ -973,6 +1063,7 @@ class Rules:
             self.arc_ticks.append(self.tick)
         elif VOCAB.chain0 <= k < VOCAB.chain0 + 2:
             self.chain_done[k - VOCAB.chain0] = self.arc_done[k - VOCAB.chain0] = True
+            self._chain(k - VOCAB.chain0)
         elif VOCAB.bomb0 <= k < VOCAB.wall0:
             self.cells.add((2, k - VOCAB.bomb0))
             self.bomb_tick[k - VOCAB.bomb0] = self.tick
@@ -1001,6 +1092,7 @@ def native_consts():
             durations=[int(d) for d in tokens.DURATIONS],
             dir_angle=[DIR_ANGLE[d] for d in range(8)],
             clash=[CLASH[c][o][d] for c in range(12) for o in range(12) for d in range(9)],
+            chain_tail=[CHAIN_TAIL[c][d] for c in range(12) for d in range(9)],
             dir_sin=[float(np.sin(np.radians(DIR_ANGLE[d]))) for d in range(8)],
             dir_cos=[float(np.cos(np.radians(DIR_ANGLE[d]))) for d in range(8)])
     scalars = dict(
@@ -1016,7 +1108,8 @@ def native_consts():
         dry_window=DRY_WINDOW, dry_grow=DRY_GROW, double_share=float(DOUBLE_SHARE), double_from=DOUBLE_FROM,
         double_push=float(DOUBLE_PUSH), double_max=float(DOUBLE_MAX),
         double_floor_push=float(DOUBLE_FLOOR_PUSH), double_floor_max=float(DOUBLE_FLOOR_MAX), air_rate=float(AIR_RATE),
-        air_from=AIR_FROM, air_push=float(AIR_PUSH), air_max=float(AIR_MAX), air_any_push=float(AIR_ANY_PUSH), air_any_max=float(AIR_ANY_MAX), arc_pair_pen=float(ARC_PAIR_PEN), arc_chain_pen=float(ARC_CHAIN_PEN), floor_every=FLOOR_EVERY, hold_from=float(HOLD_FROM),
+        air_from=AIR_FROM, air_push=float(AIR_PUSH), air_max=float(AIR_MAX), air_any_push=float(AIR_ANY_PUSH), air_any_max=float(AIR_ANY_MAX), cross_prior=float(CROSS_PRIOR), pair_prior=float(PAIR_PRIOR),
+        cross_push=float(CROSS_PUSH), cross_max=float(CROSS_MAX), arc_pair_pen=float(ARC_PAIR_PEN), arc_chain_pen=float(ARC_CHAIN_PEN), floor_every=FLOOR_EVERY, hold_from=float(HOLD_FROM),
         hold_grow=float(HOLD_GROW), hold_max=float(HOLD_MAX), obj_walls=OBJ_WALLS, obj_bombs=OBJ_BOMBS,
         obj_arcs=OBJ_ARCS, no_note=NO_NOTE, chain0=VOCAB.chain0, kind_chain=CHAIN, obj_chains=OBJ_CHAINS)
     key = tuple(scalars.items())
@@ -1028,7 +1121,7 @@ def native_consts():
 
 def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry, turn, copy, hold, times,
                  double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0),
-                 hand=(0, 0, 0), air_any=0, double_floor=0):
+                 hand=(0, 0, 0), air_any=0, double_floor=0, cross=(0, 0, 0, 0)):
     e = prefix_events
     return NATIVE.Rules(native_consts(), e["tick"], e["kind"], e["hand"], e["forehand"], e["air"], e["cell"],
                         e["dir"], e["shape"], e["dur"], int(end_tick), bool(swings), int(objects), int(max_loop),
@@ -1036,7 +1129,7 @@ def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry
                         float(hold), None if times is None else [int(t) for t in times], int(double_gap),
                         int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap), int(vision_gap),
                         int(slide_gap), *(int(x) for x in floor), *(int(x) for x in (tuple(fast) + (0,))[:4]), *(int(x) for x in hand), int(air_any),
-                        int(double_floor))
+                        int(double_floor), *(int(x) for x in cross))
 
 
 GRAPHS = True
@@ -1202,7 +1295,8 @@ def sample_window(model, audio, prefixes, weights, rules, cfg, temp, top_p, dev,
                     return NATIVE.prep(rules, done.tolist(), vocab)
                 allowed = torch.from_numpy(np.stack([eos if done[i] else r.mask()[:vocab] for i, r in enumerate(rules)]))
                 pen = [(i, tok, amount) for i, r in enumerate(rules) if not done[i]
-                       for tok, amount in r.loops.penalty(r) + r.turn_penalty() + r.hold_penalty() + r.double_penalty() + r.air_penalty() + r.arc_penalty()]
+                       for tok, amount in r.loops.penalty(r) + r.turn_penalty() + r.hold_penalty() + r.double_penalty() + r.air_penalty() + r.arc_penalty()
+                       + r.cross_penalty()]
                 return allowed, pen, [r.reset_merge() for r in rules]
 
             def draw_python(lg, prepped):
@@ -1480,6 +1574,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     air_any = int(round(AIR_ANY_RATE * 10000)) if stars is not None and stars >= AIR_ANY_STARS else 0
     double_floor = int(round(np.interp(stars, DOUBLE_FLOOR_STARS, DOUBLE_FLOOR) * 10000)) if stars is not None and DOUBLE_FLOOR_PUSH else 0
     uncross = stars is not None and stars < UNCROSS_STARS
+    cross = cross_args(beat_times, stars)
     swings = getattr(model, "swings", True)
     last_note = 0
     flux = song_flux(logmel) if music_fit or off_grid else None
@@ -1558,7 +1653,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             for _ in range(candidates):
                 r = make_rules(ev, end, swings, allow, max_loop, behind, dry, turn_now, copy, hold, times,
                                double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap, floor_now, fast_row, hand_now, air_any,
-                               double_floor)
+                               double_floor, cross)
                 r.begin(t0, new0 - 1)
                 rules.append(r)
             boost = arc_boost
@@ -1843,6 +1938,7 @@ RESET_SWEEP, RESET_STEP_S = 0.45, 0.04
 RESET_SAME_SWING_S = 0.07
 RESET_OTHER_S = 0.2
 RESET_LEAD_S = 0.1
+RESET_CUE = 4
 
 
 def _hand_resets(notes, secs, h):
@@ -1879,16 +1975,22 @@ def reset_bombs(notes, bombs, walls, to_seconds, seed=0, cell_gap_beats=CELL_GAP
         b0, b1 = float(beats[p]), float(beats[n])
         gap = b1 - b0
         both = any(o != h and min(float(beats[y]), b1) - max(float(beats[x]), b0) >= 0.5 * gap for o, x, y in pairs)
-        if gap < RESET_BEATS or not both and gap < RESET_ALONE:
+        gap_bombs = (bombs["beat"] > b0) & (bombs["beat"] < b1)
+        small = 0 < np.sum(gap_bombs & ~drop) < RESET_CUE
+        if gap < RESET_BEATS or not both and gap < RESET_ALONE and not small:
             continue
         if any(b0 < r[1] and r[0] < b1 for r in rows):
             continue
-        gap_bombs = (bombs["beat"] > b0) & (bombs["beat"] < b1)
-        if np.any(gap_bombs & ~drop) and _in_path(notes, p, n, bombs[gap_bombs & ~drop]):
+        if np.any(gap_bombs & ~drop) and _in_path(notes, p, n, bombs[gap_bombs & ~drop]) and not small:
             continue
         spb = float(secs[n] - secs[p]) / gap
         beat = max(b0 + gap * 2 / 3, b1 - FLOOR_FAR_S / spb)
-        beat = round(beat * TICKS / 4) * 4 / TICKS
+        up = secs[(secs > secs[p]) & np.isin(notes["cut_dir"], list(UP_DIRS))]
+        if len(up) and up[0] - UP_CLEAR_S - 0.01 < float(secs[p]) + (beat - b0) * spb:
+            beat = b0 + (float(up[0]) - UP_CLEAR_S - 0.01 - float(secs[p])) / spb
+            if beat < b0 + RESET_LEAD_S / spb:
+                continue
+        beat = int(beat * TICKS / 4) * 4 / TICKS if beat < b0 + gap * 2 / 3 else round(beat * TICKS / 4) * 4 / TICKS
         t = float(to_seconds(np.array([beat]))[0])
         cols = [c for c in range(4) if _bomb_fits(notes, secs, walls, beat, t, c, 0, None if both else h, cell_gap_beats)]
         walled = sum(_walled(walls, beat, c, cell_gap_beats) for c in range(4))
@@ -1919,6 +2021,11 @@ def _unblock_up(bombs, notes, secs=None):
         up = (notes["color"] == h) & np.isin(notes["cut_dir"], list(UP_DIRS))
         for t, x in zip(secs[up], notes["line"][up]):
             near |= (bombs["layer"] == 0) & (bombs["time"] > t - UP_CLEAR_S) & (bombs["time"] < t) & (np.abs(bombs["line"] - x) <= 1)
+    tick0 = np.round(bombs["beat"] * TICKS).astype(np.int64)
+    for k in np.unique(tick0[near]):
+        at = (tick0 == k) & (bombs["layer"] == 0)
+        if at.sum() >= 3 and 0 < (at & ~near).sum() < RESET_CUE:
+            near |= at
     bombs = bombs[~near]
     floor, tick = bombs["layer"] == 0, np.round(bombs["beat"] * TICKS).astype(np.int64)
     ticks, counts = np.unique(tick[floor], return_counts=True)

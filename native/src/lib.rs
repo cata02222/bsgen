@@ -30,6 +30,7 @@ struct Consts {
     dir_cos: [f64; 8],
     slide_ok: Vec<bool>,
     clash: Vec<bool>,
+    chain_tail: Vec<i64>,
     slide_turn: i64,
     forehand: [u16; 2],
     backhand: [u16; 2],
@@ -63,6 +64,10 @@ struct Consts {
     air_max: f64,
     air_any_push: f64,
     air_any_max: f64,
+    cross_prior: f64,
+    pair_prior: f64,
+    cross_push: f64,
+    cross_max: f64,
     arc_pair_pen: f64,
     arc_chain_pen: f64,
     arc_shape: Vec<f64>,
@@ -128,6 +133,7 @@ impl NativeConsts {
             dir_cos: v8("dir_cos")?,
             slide_ok: get(d, "slide_ok")?,
             clash: get(d, "clash")?,
+            chain_tail: get(d, "chain_tail")?,
             slide_turn: get(d, "slide_turn")?,
             forehand: get::<Vec<Vec<i64>>>(d, "forehand")?.iter().map(|v| bits(v)).collect::<Vec<_>>().try_into().map_err(|_| PyValueError::new_err("forehand: 2 hands"))?,
             backhand: get::<Vec<Vec<i64>>>(d, "backhand")?.iter().map(|v| bits(v)).collect::<Vec<_>>().try_into().map_err(|_| PyValueError::new_err("backhand: 2 hands"))?,
@@ -161,6 +167,10 @@ impl NativeConsts {
             air_max: get(d, "air_max")?,
             air_any_push: get(d, "air_any_push")?,
             air_any_max: get(d, "air_any_max")?,
+            cross_prior: get(d, "cross_prior")?,
+            pair_prior: get(d, "pair_prior")?,
+            cross_push: get(d, "cross_push")?,
+            cross_max: get(d, "cross_max")?,
             arc_pair_pen: get(d, "arc_pair_pen")?,
             arc_chain_pen: get(d, "arc_chain_pen")?,
             arc_shape: get(d, "arc_shape")?,
@@ -357,6 +367,15 @@ struct State {
     air_free_n: i64,
     air_any: i64,
     double_floor: i64,
+    cross_gap: i64,
+    cross_rate: i64,
+    pair_off: i64,
+    pair_crossed: i64,
+    notes_n: i64,
+    cross_n: i64,
+    pairs_n: i64,
+    pairs_off: i64,
+    pairs_crossed: i64,
     head: [Option<i64>; 2],
     rest: [Option<i64>; 2],
     owe: [bool; 2],
@@ -369,6 +388,7 @@ struct State {
     swing_tick: [Option<i64>; 2],
     air: [bool; 2],
     cells: Vec<(u8, u8)>,
+    chain_cells: u16,
     after_time: bool,
     opened: [bool; 2],
     first_dir: [Option<i64>; 2],
@@ -512,6 +532,13 @@ impl State {
 
     fn new_moment(&mut self, tick: i64) {
         if self.tick.is_some() {
+            if self.pair_off != 0 && !self.notes_now[0].is_empty() && !self.notes_now[1].is_empty() {
+                let left = self.notes_now[0].iter().map(|x| x / 9 % 4).max().unwrap();
+                let right = self.notes_now[1].iter().map(|x| x / 9 % 4).min().unwrap();
+                self.pairs_n += 1;
+                self.pairs_off += !(left <= 1 && right >= 2) as i64;
+                self.pairs_crossed += (left > right) as i64;
+            }
             if self.stack[0] != 0 || self.stack[1] != 0 {
                 self.moments_n += 1;
                 self.doubles_n += (self.stack[0] != 0 && self.stack[1] != 0) as i64;
@@ -529,6 +556,7 @@ impl State {
         self.notes_now = [Vec::new(), Vec::new()];
         self.tick = Some(tick);
         self.cells.clear();
+        self.chain_cells = 0;
         self.objects_now = false;
         self.stack = [0, 0];
         self.first_dir = [None, None];
@@ -543,6 +571,20 @@ impl State {
         let t = self.tick.unwrap();
         let (cells, lanes) = self.c.wall_cells[shape];
         self.walls.push((t, t + dur, cells, lanes, self.c.wall_head[shape]));
+    }
+
+    fn tail(&self, h: usize) -> i64 {
+        match self.notes_now[h].first() {
+            Some(&x) => self.c.chain_tail[x as usize],
+            None => -1,
+        }
+    }
+
+    fn add_chain(&mut self, h: usize) {
+        let t = self.tail(h);
+        if t >= 0 {
+            self.chain_cells |= 1 << t;
+        }
     }
 
     fn add_cell(&mut self, h: u8, cell: u8) {
@@ -577,7 +619,7 @@ impl State {
 
     fn free(&self, behind: i64, notes: bool) -> u16 {
         let t = self.tick.unwrap();
-        let mut out = ALL_CELLS & !self.cells.iter().fold(0u16, |m, &(_, c)| m | 1 << c) & !self.covered(behind, notes);
+        let mut out = ALL_CELLS & !self.cells.iter().fold(0u16, |m, &(_, c)| m | 1 << c) & !self.chain_cells & !self.covered(behind, notes);
         if self.cell_gap != 0 {
             let near = |v: &[Option<i64>; 12]| {
                 (0..12).filter(|&c| v[c].is_some_and(|x| 0 < t - x && t - x < self.cell_gap)).fold(0u16, |m, c| m | 1 << c)
@@ -901,9 +943,12 @@ impl State {
         }
         if self.objects & c.obj_chains != 0 {
             for h in 0..2 {
+                let tail = self.tail(h);
                 ok[c.chain0 + h] = self.stack[h] == 1
                     && !self.chain_done[h]
-                    && self.notes_now[h].first().is_some_and(|n| n % 9 != 8);
+                    && self.notes_now[h].first().is_some_and(|n| n % 9 != 8)
+                    && tail >= 0
+                    && note_free >> tail & 1 == 1;
             }
         }
         if !self.swings {
@@ -1023,6 +1068,69 @@ impl State {
         vec![((c.time0 as i64 + k) as usize, self.hold * (1.0 + over / c.hold_grow).min(c.hold_max))]
     }
 
+    fn near(&self, h: usize) -> bool {
+        let o = 1 - h;
+        self.stack[o] != 0
+            || matches!((self.prev_moment[o], self.tick), (Some(p), Some(t)) if t - p <= self.cross_gap)
+    }
+
+    fn count_cross(&mut self, h: usize, cell: i64) {
+        if self.cross_rate == 0 {
+            return;
+        }
+        self.notes_n += 1;
+        if self.c.hand_cols[h] >> (cell % 4) & 1 == 0 && self.near(h) {
+            self.cross_n += 1;
+        }
+    }
+
+    fn cross_penalty(&self) -> Vec<(usize, f64)> {
+        let c = &self.c;
+        if self.cross_rate == 0 || self.tick.is_none() {
+            return Vec::new();
+        }
+        let push = |n: i64, k: i64, prior: f64, rate: i64| {
+            let r = rate as f64 / 10000.0;
+            (c.cross_push * ((n as f64 + prior * r) / (k as f64 + prior) - r) / 0.05).min(c.cross_max).max(0.0)
+        };
+        let amount = push(self.cross_n, self.notes_n, c.cross_prior, self.cross_rate);
+        let mut out = Vec::new();
+        if amount > 0.0 {
+            for h in 0..2 {
+                if !self.near(h) {
+                    continue;
+                }
+                for cell in 0..12 {
+                    if c.hand_cols[h] >> (cell % 4) & 1 == 0 {
+                        for d in 0..9 {
+                            out.push((self.note(h, cell, d), amount));
+                        }
+                    }
+                }
+            }
+        }
+        if self.pair_off != 0 && !self.notes_now[0].is_empty() {
+            let off = push(self.pairs_off, self.pairs_n, c.pair_prior, self.pair_off);
+            let crossed = push(self.pairs_crossed, self.pairs_n, c.pair_prior, self.pair_crossed);
+            let top = self.notes_now[0].iter().map(|x| x / 9 % 4).max().unwrap() as usize;
+            for cell in 0..12 {
+                let lane = cell % 4;
+                let a = if lane < top { off + crossed } else if lane <= 1 { off } else { 0.0 };
+                if a > 0.0 {
+                    for d in 0..9 {
+                        out.push((self.note(1, cell, d), a));
+                    }
+                }
+            }
+            if top >= 2 && off > 0.0 && self.swing_tick[1] != self.tick {
+                for f in [false, true] {
+                    out.push((self.swing(1, f, false), off));
+                }
+            }
+        }
+        out
+    }
+
     fn double_penalty(&self) -> Vec<(usize, f64)> {
         let c = &self.c;
         if self.moments_n < c.double_from || self.need_note.is_some() || self.tick.is_none() {
@@ -1114,6 +1222,7 @@ impl State {
         out.extend(self.double_penalty());
         out.extend(self.air_penalty());
         out.extend(self.arc_penalty());
+        out.extend(self.cross_penalty());
         out
     }
 
@@ -1166,6 +1275,7 @@ impl State {
             let (cell, d) = ((j / 9 % 12) as i64, (j % 9) as i64);
             let tick = self.tick.unwrap();
             self.loops.add(&c, tick, h as i64, cell, d, true);
+            self.count_cross(h, cell);
             self.notes_now[h].push((j % 108) as i64);
             self.add_cell(h as u8, cell as u8);
             self.cell_tick[cell as usize] = Some(tick);
@@ -1192,6 +1302,7 @@ impl State {
         } else if c.chain0 <= k && k < c.chain0 + 2 {
             self.chain_done[k - c.chain0] = true;
             self.arc_done[k - c.chain0] = true;
+            self.add_chain(k - c.chain0);
         } else if c.bomb0 <= k && k < c.wall0 {
             let cell = (k - c.bomb0) as i64;
             self.add_cell(2, cell as u8);
@@ -1233,7 +1344,7 @@ impl Rules {
     #[new]
     #[pyo3(signature = (consts, tick, kind, hand, forehand, air, cell, dir, shape, dur, end_tick, swings, objects,
                         max_loop, behind, dry, turn, copy, hold, times, double_gap, cell_gap, swing_gap, uncross, near_gap,
-                        wall_gap, vision_gap, slide_gap, floor_rate, floor_min, floor_far, fast_cap, fast_gap, fast_span, air_cue, hand_cap, hand_gap, hand_span, air_any, double_floor))]
+                        wall_gap, vision_gap, slide_gap, floor_rate, floor_min, floor_far, fast_cap, fast_gap, fast_span, air_cue, hand_cap, hand_gap, hand_span, air_any, double_floor, cross_gap=0, cross_rate=0, pair_off=0, pair_crossed=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         consts: &NativeConsts,
@@ -1276,6 +1387,10 @@ impl Rules {
         hand_span: i64,
         air_any: i64,
         double_floor: i64,
+        cross_gap: i64,
+        cross_rate: i64,
+        pair_off: i64,
+        pair_crossed: i64,
     ) -> PyResult<Self> {
         let c = consts.c.clone();
         let mut s = State {
@@ -1321,6 +1436,15 @@ impl Rules {
             air_free_n: 0,
             air_any,
             double_floor,
+            cross_gap,
+            cross_rate,
+            pair_off,
+            pair_crossed,
+            notes_n: 0,
+            cross_n: 0,
+            pairs_n: 0,
+            pairs_off: 0,
+            pairs_crossed: 0,
             head: [None, None],
             rest: [None, None],
             owe: [false, false],
@@ -1344,6 +1468,7 @@ impl Rules {
             swing_tick: [None, None],
             air: [true, true],
             cells: Vec::new(),
+            chain_cells: 0,
             after_time: false,
             opened: [false, false],
             first_dir: [None, None],
@@ -1380,6 +1505,7 @@ impl Rules {
             if k == k_note {
                 let (cl, d) = (cell[i] as i64, dir[i] as i64);
                 s.loops.add(&c, t, h as i64, cl, d, false);
+                s.count_cross(h, cl);
                 s.notes_now[h].push(cl * 9 + d);
                 s.opened[h] = true;
                 s.ahead(h, cl);
@@ -1404,6 +1530,7 @@ impl Rules {
             } else if k == c.kind_chain {
                 s.chain_done[h] = true;
                 s.arc_done[h] = true;
+                s.add_chain(h);
             } else if k == k_swing {
                 let (fh, a) = (forehand[i], air[i]);
                 let same = s.face[h] == Some(fh) && !a;

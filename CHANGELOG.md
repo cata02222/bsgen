@@ -1,5 +1,11 @@
 # Changelog
 
+**1.5.1** (2026-11-15)
+- fewer crossed swings, so fewer awkward hand-overs in fast patterns
+- chain tails land on the beat grid, in a free spot
+- replays: the sabers start in a ready pose, no more missed notes in busy or bomb-heavy parts, and swings look more natural
+- replays take less than half the time
+
 **1.5** (2026-11-13)
 - new map model: sideways swings and dots like mappers make them, fewer crossed doubles
 - new rhythm model: busy parts follow the song, fast drops stay fast at high stars

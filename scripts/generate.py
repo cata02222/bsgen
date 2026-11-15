@@ -198,6 +198,7 @@ def parser():
                                                                                   if kind != "chain" else "; chains only when asked for)")
                         + ", for map models trained with the amounts")
     ap.add_argument("--no-lights", action="store_true", help="leave the lightshow out")
+    ap.add_argument("--light-audio", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--lights", choices=["model", "old", "rules"], default="model",
                     help="model: the lighting model (the whole song heard at once, all difficulties' shows written "
                          "together); old: the earlier lighting model; rules: lights that follow the notes and "
@@ -666,7 +667,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                 guide = lightseq.guide_notes(hits / rhythm.TICKS + offset, guide["beat"].min(), guide["beat"].max())
                 log(f"lights: written from a {lightseq.GUIDE_STARS:g}★ rhythm of the song ({len(guide)} hits), the hardest difficulty's notes being few")
             shows, _ = lightseq.lightshows(lighter, logmel, fps, beat_times, offset, [guide], bpm,
-                                           seed=args.seed or 0, dev=args.device, end=end_beat, song_end=float(n_beats))
+                                           seed=args.seed or 0, dev=args.device, end=end_beat, song_end=float(n_beats), audio=args.light_audio)
             for lv in levels:
                 lv["lights"] = shows[0]
         levels = list(ex.map(finish, levels))

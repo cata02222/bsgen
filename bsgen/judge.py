@@ -1,3 +1,7 @@
+import collections
+import hashlib
+import threading
+
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
@@ -89,8 +93,30 @@ def velocities(hilt, blade):
     return vel / (np.linalg.norm(vel, axis=-1, keepdims=True) + 1e-10)
 
 
+SIM_CHUNK = 30
+
+
 def simulate(notes, motion, t0, vel=None):
     motion = np.asarray(motion, np.float32)
+    n = motion.shape[1]
+    if n - 1 <= SIM_CHUNK:
+        return _simulate(notes, motion, t0, vel)
+    if vel is None:
+        vel = velocities(*tips(motion))
+    parts = [_simulate(notes, motion[:, a:a + SIM_CHUNK + 1], t0 + a / FPS, vel[:, a:a + SIM_CHUNK + 1])
+             for a in range(0, n - 1, SIM_CHUNK)]
+    ids = np.unique(np.concatenate([p.ids for p in parts])).astype(np.int64)
+    C, K = motion.shape[0], len(ids)
+    good, bad = np.zeros((C, n - 1, 2, K), bool), np.zeros((C, n - 1, 2, K), bool)
+    angle = np.full((C, n - 1, K), np.nan, np.float32)
+    for a, p in zip(range(0, n - 1, SIM_CHUNK), parts):
+        j = np.searchsorted(ids, p.ids)
+        f = slice(a, a + p.good.shape[1])
+        good[:, f][..., j], bad[:, f][..., j], angle[:, f][..., j] = p.good, p.bad, p.angle
+    return Result(ids, good, bad, angle, np.concatenate([p.in_wall for p in parts], 1))
+
+
+def _simulate(notes, motion, t0, vel=None):
     C, n = motion.shape[:2]
     hilt, blade = tips(motion)
     vel = (velocities(hilt, blade) if vel is None else vel)[:, 1:]
@@ -146,6 +172,32 @@ def simulate(notes, motion, t0, vel=None):
     return Result(ids, good, bad, angle, in_wall)
 
 
+WALL_MARGIN = 0.2
+
+
+def wall_closeness(notes, motion, t0):
+    C, F = motion.shape[:2]
+    out = np.zeros((C, F), np.float32)
+    if not len(notes.wall_time):
+        return out
+    times = t0 + np.arange(F) / FPS
+    rel_w0 = notes.wall_time[None] - times[:, None]
+    rel_w1 = notes.wall_end[None] - times[:, None]
+    w = ((rel_w0 < 1.0) & (rel_w1 > -0.5)).any(0)
+    if not w.any():
+        return out
+    near = rel_w0[:, w] * notes.njs + NOTE_DEPTH
+    far = near + (rel_w1[:, w] - rel_w0[:, w]) * notes.njs + NOTE_DEPTH
+    z0, z1 = np.minimum(near, far), np.maximum(near, far)
+    h = motion[..., None, :3]
+    lo, hi = notes.wall_lo[w], notes.wall_hi[w]
+    d = np.maximum(np.maximum(lo - h[..., :2], h[..., :2] - hi), 0)
+    gap = np.linalg.norm(d, axis=-1)
+    level = (h[..., 2] > z0 - 0.1) & (h[..., 2] < z1 + 0.1)
+    close = np.clip(1 - gap / WALL_MARGIN, 0, 1) * level
+    return close.max(-1)
+
+
 def first_touches(result):
     good, bad = result.good.any(2), result.bad.any(2)
     never = good.shape[1]
@@ -176,6 +228,7 @@ class Judge:
         skip = max(start - k - 1, 0)
         if traj.shape[1] <= skip + 1:
             self.last = self.cut = None
+            self.short = np.zeros(C)
             return np.zeros(C)
         r = simulate(self.notes, traj, k / FPS)
         r.good, r.bad, r.in_wall = r.good[:, skip:], r.bad[:, skip:], r.in_wall[:, skip:]
@@ -185,8 +238,36 @@ class Judge:
         wrong = (fb <= fg) & (fb < never) & open_
         self.ids, self.last = r.ids, cut | wrong
         in_wall = r.in_wall.sum(1)
+        close = wall_closeness(self.notes, traj[:, skip + 1:], (k + skip + 1) / FPS).sum(1)
         self.cut, self.clean_run = cut, ~wrong.any(1) & (in_wall == 0)
-        return cut.sum(1) - wrong.sum(1) - in_wall / self.WALL_FRAMES
+        self.short = self._short(cands, past, r.ids, cut, fg)
+        return cut.sum(1) - wrong.sum(1) - (in_wall + close) / self.WALL_FRAMES
+
+    def _short(self, cands, past, ids, cut, fg):
+        C = len(cands)
+        out = np.zeros(C)
+        if not cut.any():
+            return out
+        full = np.concatenate([np.repeat(np.asarray(past, np.float32)[-RATE_BEFORE:][None], C, 0),
+                               np.asarray(cands, np.float32)], 1)
+        lead = full.shape[1] - cands.shape[1]
+        hilt, blade = tips(full)
+        tip = hilt + blade
+        for c, j in zip(*np.nonzero(cut)):
+            k = ids[j]
+            f = lead + int(fg[c, j])
+            if f < 3:
+                continue
+            h = int(self.notes.color[k])
+            b = blade[c, max(f - RATE_BEFORE, 0):f, h]
+            way = self.notes.along[k]
+            if self.notes.dir[k] == DOT:
+                v = tip[c, f, h, :2] - tip[c, f - 2, h, :2]
+                way = np.array([*v, 0.0], np.float32) / (np.linalg.norm(v) + 1e-9)
+            p0, p1 = b[:, 2], b @ way
+            ang = np.sign(p1) * np.degrees(np.arccos(np.clip(p0 / np.maximum(np.hypot(p0, p1), 1e-8), -1, 1)))
+            out[c] += 1 - np.clip(ang.min() / -100, 0, 1)
+        return out
 
     def clean(self, i, lo, hi):
         if self.cut is None:
@@ -195,6 +276,15 @@ class Judge:
         cut = np.zeros(len(self.done), bool)
         cut[self.ids] = self.cut[i]
         return bool(self.clean_run[i] and cut[due].all())
+
+    def missed(self, i, lo, hi, cut_too=False):
+        due = ~self.done & (self.times >= lo) & (self.times < hi)
+        if cut_too:
+            return np.flatnonzero(due)
+        cut = np.zeros(len(self.done), bool)
+        if self.cut is not None:
+            cut[self.ids] = self.cut[i]
+        return np.flatnonzero(due & ~cut)
 
     def keep(self, i):
         if self.last is not None:
@@ -206,7 +296,37 @@ RATE_BEFORE, RATE_AFTER = 24, 25
 MISS_AFTER = 0.2
 
 
-def replay_hits(notes, motion, chunk=120):
+_HITS = collections.OrderedDict()
+_HITS_KEEP = 4
+_HITS_LOCK = threading.Lock()
+
+
+def _digest(*arrays):
+    h = hashlib.blake2b(digest_size=16)
+    for a in arrays:
+        a = np.ascontiguousarray(a)
+        h.update(str((a.dtype, a.shape)).encode())
+        h.update(a.data)
+    return h.digest()
+
+
+def replay_hits(notes, motion, chunk=SIM_CHUNK):
+    motion = np.asarray(motion)
+    key = (_digest(notes.time, notes.color, notes.dir, notes.centre, notes.along, notes.scoring_type,
+                   np.float64(notes.njs)), _digest(motion[:, 9:]), chunk)
+    with _HITS_LOCK:
+        if key in _HITS:
+            _HITS.move_to_end(key)
+            return _HITS[key]
+    out = _replay_hits(notes, motion, chunk)
+    with _HITS_LOCK:
+        _HITS[key] = out
+        while len(_HITS) > _HITS_KEEP:
+            _HITS.popitem(last=False)
+    return out
+
+
+def _replay_hits(notes, motion, chunk):
     m = np.concatenate([motion[:1], motion])[None].astype(np.float32)
     hilt, blade = tips(m)
     vel = velocities(hilt, blade)
@@ -246,8 +366,8 @@ def _dot_angles(blade, vel, f):
     return ang[:cut], ang[cut:]
 
 
-def note_events(notes, motion, height):
-    good, bad, bad_saber, band = replay_hits(notes, motion)
+def note_events(notes, motion, height, hits=None):
+    good, bad, bad_saber, band = replay_hits(notes, motion) if hits is None else hits
     hilt, blade = tips(motion.astype(np.float64))
     tip = hilt + blade
     vel = np.gradient(tip, axis=0) * FPS

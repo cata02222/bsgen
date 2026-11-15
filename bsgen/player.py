@@ -1,4 +1,5 @@
 import math
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -91,7 +92,18 @@ def window_objects(objects, t, n_future=F):
     after = [_nearest(objects["kind"][hi:hi + 256], c) for c in (RED, BLUE)]
     before = [objects[a - 1 - i] for i in before if i is not None]
     after = [objects[hi + i] for i in after if i is not None]
-    return np.concatenate([np.array(before, OBJECT_DTYPE), o, np.array(after, OBJECT_DTYPE)])[:MAX_OBJECTS]
+    o = np.concatenate([np.array(before, OBJECT_DTYPE), o, np.array(after, OBJECT_DTYPE)])
+    return o if len(o) <= MAX_OBJECTS else _most_needed(o, t, n_future)
+
+
+def _most_needed(o, t, n_future):
+    note = (o["kind"] != WALL) & (o["kind"] != BOMB)
+    lanes = (o["kind"] == WALL) & (o["line"] < 4) & (o["line"] + o["width"] > 0)
+    gap = np.maximum(np.maximum(t - o["end"], o["time"] - (t + n_future / HZ)), 0.0)
+    side = (o["kind"] == WALL) & ~lanes
+    rank = np.select([note, lanes, side], [-2.0, -1.0, 1.0], 0.0) + np.minimum(gap, 10.0) / 100.0
+    keep = np.sort(np.argsort(rank, kind="stable")[:MAX_OBJECTS])
+    return o[keep]
 
 
 def _nearest(kinds, c):
@@ -249,7 +261,8 @@ class Player(nn.Module):
 
 class Sampler:
 
-    def __init__(self, model, steps=12):
+    def __init__(self, model, steps=None):
+        steps = steps or FLOW_STEPS
         self.model, self.steps, self.graphs = model, steps, {}
         self.cuda = model.out.weight.is_cuda
         if self.cuda:
@@ -262,9 +275,10 @@ class Sampler:
         args = [a.expand(len(noise), *a.shape[1:]) for a in (past, ints, times, mask, cond)]
         if not self.cuda:
             return self.model.sample(*args, steps=self.steps, noise=noise)
-        if len(noise) not in self.graphs:
-            self.graphs[len(noise)] = self._capture(*args, noise)
-        graph, ins, out = self.graphs[len(noise)]
+        key = (len(noise), ints.shape[1])
+        if key not in self.graphs:
+            self.graphs[key] = self._capture(*args, noise)
+        graph, ins, out = self.graphs[key]
         for buf, a in zip(ins, (*args, noise)):
             buf.copy_(a)
         graph.replay()
@@ -288,12 +302,123 @@ class Sampler:
             return graph, ins, out
 
 
+GUIDE_DRAWS, GUIDE_ITERS, GUIDE_LR, GUIDE_PRIOR, GUIDE_FRAMES = 4, 12, 0.05, 10.0, (-8, 4)
+GUIDE = True
+STEP_TAIL = 0.1
+BACK_TRIES = 3
+
+
+def _blade_points(m, h):
+    c = 9 * (1 + h)
+    a = m[..., c + 3:c + 6]
+    b = m[..., c + 6:c + 9]
+    a = a / a.norm(dim=-1, keepdim=True)
+    b = b - (a * b).sum(-1, keepdim=True) * a
+    b = b / b.norm(dim=-1, keepdim=True)
+    return m[..., c:c + 3], torch.cross(a, b, dim=-1)
+
+
+def guide_loss(m, t, notes, ks):
+    from . import judge
+    dev = m.device
+    total = m.new_zeros(len(m), len(ks))
+    u = torch.linspace(0.2, 1.0, 5, device=dev)
+    for j, k in enumerate(ks):
+        f0 = int(round((notes.time[k] - t) * HZ))
+        lo, hi = max(f0 + GUIDE_FRAMES[0], 1), min(f0 + GUIDE_FRAMES[1], m.shape[1] - 1)
+        if hi <= lo:
+            continue
+        hilt, blade = _blade_points(m, int(notes.color[k]))
+        fr = torch.arange(lo, hi, device=dev)
+        pts = hilt[:, fr, None] + blade[:, fr, None] * u[:, None]
+        depth = (notes.time[k] - t - fr / HZ) * notes.njs + judge.NOTE_DEPTH + judge.CUT_BOX_SHIFT
+        c = torch.stack([torch.full_like(depth, float(notes.centre[k][0])),
+                         torch.full_like(depth, float(notes.centre[k][1])), depth.float()], -1)
+        across = torch.as_tensor(notes.across[k], device=dev)
+        along = torch.as_tensor(notes.along[k], device=dev)
+        d = pts - c[None, :, None]
+        e = (d @ across / judge.CUT_BOX[0]) ** 2 + (d @ along / judge.CUT_BOX[1]) ** 2 \
+            + (d[..., 2] / judge.CUT_BOX[2]) ** 2
+        tip = hilt + blade
+        v = (tip[:, fr + 1] - tip[:, fr - 1]) * (HZ / 2)
+        if notes.dir[k] != judge.DOT:
+            e = e + (torch.relu(2.0 - v @ along) ** 2 / 4.0)[..., None]
+        total[:, j] = torch.relu(-0.1 * torch.logsumexp(-e.flatten(1) / 0.1, 1) - 0.3)
+    return total
+
+
+def guided_sample(model, past, ints, times, mask, cond, noise, t, notes, ks, aim, steps):
+    aim = torch.as_tensor(aim, device=noise.device)
+    args = [a.expand(len(noise), *a.shape[1:]) for a in (past, ints, times, mask, cond)]
+    last = args[0][:, -1:]
+    z = noise.clone().requires_grad_(True)
+    opt = torch.optim.Adam([z], lr=GUIDE_LR)
+    best, best_loss = None, None
+    for it in range(GUIDE_ITERS + 1):
+        with torch.enable_grad():
+            x = z
+            for i in range(steps):
+                tf = torch.full((len(x),), i / steps, device=x.device)
+                x = x + model(args[0], x, tf, *args[1:]).float() / steps
+            m = x * model.dstd + last
+            per = guide_loss(m, t, notes, ks)
+            if it == 0:
+                start = per.detach()
+            L = torch.where(aim, per, torch.relu(per - start - 0.05)).sum(1)
+            prior = ((z.pow(2).mean((1, 2)) - 1.0) ** 2)
+            if best is None:
+                best, best_loss = m.detach().clone(), L.detach().clone()
+            else:
+                better = L.detach() < best_loss
+                best[better], best_loss[better] = m.detach()[better], L.detach()[better]
+            if it == GUIDE_ITERS or (best_loss <= 0).all():
+                break
+            opt.zero_grad()
+            (L.sum() + GUIDE_PRIOR * prior.sum()).backward()
+            opt.step()
+    return best
+
+
+FLOW_STEPS = 8
+OBJECT_BUCKETS = (32, 64, MAX_OBJECTS)
+_free_samplers = {}
+_free_lock = threading.Lock()
+
+
+def _take_sampler(model, steps):
+    with _free_lock:
+        free = _free_samplers.get((id(model), steps), [])
+        while free:
+            s = free.pop()
+            if s.model is model:
+                return s
+    return Sampler(model, steps)
+
+
+def _give_sampler(sampler):
+    with _free_lock:
+        _free_samplers.setdefault((id(sampler.model), sampler.steps), []).append(sampler)
+
+
 def motion_stats(data, n=4096):
     idx = np.random.default_rng(0).integers(0, len(data), n)
     s = [data[int(i)] for i in idx]
     allm = np.concatenate([np.concatenate([x["past"], x["future"]]) for x in s])
     d = np.concatenate([x["future"] - x["past"][-1:] for x in s])
     return dict(mean=allm.mean(0), std=allm.std(0) + 1e-3, dstd=d.std(0) + 1e-3)
+
+
+READY_POSE = np.array([
+    -0.0664, 1.625, -0.059, 0.9995, -0.0089, 0.029, 0.0021, 0.9745, 0.2245,
+    -0.2961, 0.8203, 0.2384, 0.8082, -0.5616, -0.1776, 0.5886, 0.7803, 0.2112,
+    0.2076, 0.8071, 0.1436, 0.9108, 0.4129, 0.0056, -0.3538, 0.7732, 0.5263], np.float32)
+
+
+def ready_pose(height=1.7):
+    pose = orthonormal(READY_POSE)
+    for j in range(3):
+        pose[9 * j:9 * j + 3] *= height / 1.7
+    return pose
 
 
 def orthonormal(m):
@@ -321,7 +446,16 @@ def limit_turns(fut, prev, cap):
         cols = slice(9 * h + 3, 9 * h + 9)
         R = _rot(out[..., cols].astype(np.float64))
         last = np.repeat(_rot(prev[cols].astype(np.float64))[None], len(R), 0)
-        for f in range(R.shape[1]):
+        seq = np.concatenate([last[:, None], R], 1)
+        rel = np.einsum("cfji,cfjk->cfik", seq[:, :-1], seq[:, 1:])
+        ang = np.arccos(np.clip((np.trace(rel, axis1=2, axis2=3) - 1) / 2, -1, 1))
+        over = (ang > step[None, :, h - 1]).any(0)
+        if not over.any():
+            continue
+        f0 = int(over.argmax())
+        if f0:
+            last = R[:, f0 - 1]
+        for f in range(f0, R.shape[1]):
             rel = np.einsum("cji,cjk->cik", last, R[:, f])
             ang = np.arccos(np.clip((np.trace(rel, axis1=1, axis2=2) - 1) / 2, -1, 1))
             over = ang > step[f, h - 1]
@@ -339,6 +473,7 @@ _ARROW /= np.linalg.norm(_ARROW, axis=1, keepdims=True)
 
 
 MORE_ROUNDS = 4
+SHORT_SWING = 0.1
 
 
 def off_cuts(cands, past, objects, t):
@@ -368,6 +503,42 @@ def off_cuts(cands, past, objects, t):
     return out
 
 
+UPS, DOWNS = (0, 4, 5), (1, 6, 7)
+DROP, DROP_AFTER, DROP_BEFORE, DROP_COST = 0.3, 0.15, 0.25, 1 / 30
+
+
+def drop_spans(objects):
+    bombs = objects["time"][objects["kind"] == BOMB]
+    out = []
+    for c in (RED, BLUE):
+        n = objects[objects["kind"] == c]
+        _, first = np.unique(n["time"], return_index=True)
+        n = n[first]
+        a, b = n[:-1], n[1:]
+        keep = np.isin(a["dir"], UPS) & np.isin(b["dir"], DOWNS) & (b["time"] - a["time"] >= 0.5)
+        s = np.stack([a["time"][keep] + DROP_AFTER, b["time"][keep] - DROP_BEFORE], 1)
+        s = s[np.searchsorted(bombs, s[:, 0]) == np.searchsorted(bombs, s[:, 1])]
+        out.append(s)
+    return out
+
+
+def drop_cost(cands, past, spans, t):
+    C = len(cands)
+    full = np.concatenate([np.repeat(np.asarray(past)[None], C, 0), cands], 1)
+    ft = t + (np.arange(full.shape[1]) - len(past)) / HZ
+    cost = np.zeros(C)
+    for c, sp in zip((RED, BLUE), spans):
+        sp = sp[(sp[:, 1] > t) & (sp[:, 0] < t + F / HZ)]
+        for a, b in sp:
+            k = np.flatnonzero((ft >= a) & (ft < b))
+            if not len(k):
+                continue
+            y = full[:, k, 9 * (1 + c) + 1]
+            under = np.maximum.accumulate(y, 1) - y > DROP
+            cost += (under & (k >= len(past))).sum(1) * DROP_COST
+    return cost
+
+
 def turn_caps(objects, t):
     ft = t + np.arange(F) / HZ
     caps = []
@@ -378,57 +549,113 @@ def turn_caps(objects, t):
     return np.stack(caps, 1)
 
 
-def play(model, objects, height=1.7, njs=18.0, start_pose=None, steps=12, seed=0, dev="cuda", t_end=None,
+def play(model, objects, height=1.7, njs=18.0, start_pose=None, steps=None, seed=0, dev="cuda", t_end=None,
          warmup=2.0, recenter=0.3, candidates=1, judge=None, progress=None, accuracy=PLAY_ACCURACY, turns=True):
+    steps = steps or FLOW_STEPS
     g = torch.Generator(device=dev).manual_seed(seed)
-    sampler = Sampler(model, steps)
+    sampler = _take_sampler(model, steps)
+    try:
+        return _play(model, objects, height, njs, start_pose, steps, dev, t_end, warmup, recenter, candidates, judge,
+                     progress, accuracy, turns, g, sampler)
+    finally:
+        _give_sampler(sampler)
+
+
+def _play(model, objects, height, njs, start_pose, steps, dev, t_end, warmup, recenter, candidates, judge, progress,
+          accuracy, turns, g, sampler):
     if candidates > 1 and judge is None:
         from .judge import Judge
         judge = Judge(objects, njs)
     t0 = float(objects["time"].min()) - warmup
     t_end = t_end or float(objects["end"].max()) + 1.0
-    pose = model.mean.cpu().numpy() if start_pose is None else np.asarray(start_pose, np.float32)
+    pose = ready_pose(height) if start_pose is None else np.asarray(start_pose, np.float32)
+    lead = pose if pose.ndim == 2 else pose[None]
+    pose = lead[-1]
     home = pose[:3].copy()
     walls = objects[objects["kind"] == WALL]
     walls = walls[(walls["line"] < 3) & (walls["line"] + walls["width"] > 1)]
     ease = np.linspace(0, 1, F, dtype=np.float32)[:, None]
-    motion = [np.repeat(pose[None], P, 0)]
-    t = t0 + P / HZ
-    while t < t_end:
-        past = np.concatenate(motion)[-P:]
+    spans = drop_spans(objects)
+    motion = [np.concatenate([np.repeat(lead[:1], max(P - len(lead), 0), 0), lead])[-P:]]
+    def step(t, past):
         ints, times, mask = object_features(window_objects(objects, t), t)
+        size = next(b for b in OBJECT_BUCKETS if b >= MAX_OBJECTS - mask.sum())
+        ints, times, mask = ints[:size], times[:size], mask[:size]
         cond = [height, njs, accuracy_input(accuracy)][:model.config.get("conds", 2)]
         inputs = [torch.as_tensor(a)[None].to(dev) for a in (past, ints, times, mask, np.array(cond, np.float32))]
         noise = torch.randn(candidates, F, DIM, device=dev, generator=g)
         near_wall = np.any((walls["time"] < t + F / HZ + 1.0) & (walls["end"] > t - 1.0))
 
-        def draw(noise):
-            fut = orthonormal(sampler(*inputs, noise).float().cpu().numpy())
+        def draw(noise, raw=None):
+            fut = orthonormal((sampler(*inputs, noise) if raw is None else raw).float().cpu().numpy())
             if recenter and not near_wall:
                 shift = recenter * (fut[:, :, :3].mean(1) - home)
                 for j in range(3):
                     fut[:, :, 9 * j:9 * j + 3] -= ease * shift[:, None]
             return limit_turns(fut, orthonormal(past[-1]), turn_caps(objects, t)) if turns else fut
 
-        if candidates > 1:
-            fut = draw(noise[:1])
-            judge.score(fut, t, past)
-            if not judge.clean(0, t - 0.3, t + F / HZ - 0.2) or off_cuts(fut, past, objects, t)[0]:
-                fut = np.concatenate([fut, draw(noise[1:])])
-                while True:
-                    sc = judge.score(fut, t, past)
-                    top = np.flatnonzero(sc >= sc.max() - 1e-6)
-                    best = int(top[np.argmin(off_cuts(fut[top], past, objects, t))])
-                    if len(fut) >= candidates * MORE_ROUNDS or judge.clean(best, t - 0.3, t + F / HZ - 0.2):
-                        break
-                    more = torch.randn(candidates, F, DIM, device=dev, generator=g)
-                    fut = np.concatenate([fut, draw(more)])
+        if candidates <= 1:
+            return draw(noise)[0], 0
+        lo, hi = t - 0.3, t + F / HZ - STEP_TAIL
+
+        def pick(fut):
+            drops = drop_cost(fut, past, spans, t)
+            sc = judge.score(fut, t, past) - drops
+            top = np.flatnonzero(sc >= sc.max() - 1e-6)
+            off = off_cuts(fut[top], past, objects, t)
+            top = top[off == off.min()]
+            return int(top[np.argmin(judge.short[top])]), drops
+
+        fut = draw(noise[:1])
+        judge.score(fut, t, past)
+        best = 0
+        if not judge.clean(0, lo, hi) or off_cuts(fut, past, objects, t)[0] \
+                or drop_cost(fut, past, spans, t)[0] or judge.short[0] > SHORT_SWING:
+            fut = np.concatenate([fut, draw(noise[1:])])
+            while True:
+                best, drops = pick(fut)
+                if len(fut) >= candidates * MORE_ROUNDS or (judge.clean(best, lo, hi) and not drops[best]):
+                    break
+                more = torch.randn(candidates, F, DIM, device=dev, generator=g)
+                fut = np.concatenate([fut, draw(more)])
+            if GUIDE and not judge.clean(best, lo, hi):
+                aim = judge.missed(best, lo, hi)
+                if len(aim):
+                    ks = judge.missed(best, lo, hi + 0.4, cut_too=True)
+                    more = torch.randn(GUIDE_DRAWS, F, DIM, device=dev, generator=g)
+                    guided = guided_sample(model, *inputs, more, t, judge.notes, ks, np.isin(ks, aim), sampler.steps)
+                    fut = np.concatenate([fut, draw(None, guided)])
+                    best, _ = pick(fut)
+        problems = len(judge.missed(best, lo, hi))
+        judge.keep(best)
+        return fut[best], problems
+
+    t = t0 + P / HZ
+    done = []
+    while t < t_end:
+        before = judge.done.copy() if judge is not None else None
+        fut, problems = step(t, np.concatenate(motion)[-P:])
+        if problems and GUIDE and done and done[-1][1] == 0:
+            kept = judge.done.copy()
+            tries = [(problems, None)]
+            for _ in range(BACK_TRIES):
+                judge.done[:] = done[-1][0]
+                prev, p0 = step(t - F / HZ, np.concatenate(motion[:-1])[-P:])
+                cur, p1 = step(t, np.concatenate(motion[:-1] + [prev])[-P:])
+                tries.append((p0 + p1, (prev, cur, judge.done.copy(), p0)))
+                if p0 + p1 == 0:
+                    break
+            n, won = min(tries, key=lambda x: x[0])
+            if won is not None:
+                prev, fut, after, p0 = won
+                motion[-1] = prev
+                done[-1] = (done[-1][0], p0)
+                judge.done[:] = after
+                problems = n - p0
             else:
-                best = 0
-            judge.keep(best)
-        else:
-            fut, best = draw(noise), 0
-        motion.append(fut[best])
+                judge.done[:] = kept
+        motion.append(fut)
+        done.append((before, problems))
         t += F / HZ
         if progress:
             progress(min(t, t_end), t_end)

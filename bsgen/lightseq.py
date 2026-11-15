@@ -442,6 +442,7 @@ def fade_end(m, last):
 COUNT_GROUPS = 8
 TRIES = 4
 TRIES_HAND = 8
+AUDIO = 0.0
 
 
 def busy_for(notes, bpm):
@@ -452,9 +453,12 @@ def busy_for(notes, bpm):
 
 @torch.no_grad()
 def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, seed=0, dev="cuda", keep=1024, graph=True,
-                   made=UNKNOWN, liked=0, grouped=False):
+                   made=UNKNOWN, liked=0, grouped=False, audio=0.0):
     vocab = model.vocab
     notes = np.asarray(notes)
+    heard = notes.shape[0] if audio else 0
+    if heard:
+        notes, busy, fade = np.concatenate([notes, notes]), list(busy) * 2, list(fade) * 2
     R, T = notes.shape[0], len(sec)
     cuda = str(dev).startswith("cuda")
     torch.manual_seed(seed)
@@ -465,7 +469,8 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
     bz = torch.tensor(np.asarray(busy, np.float32), device=dev)
     fd = torch.tensor(np.asarray(fade, np.float32), device=dev)
     with ac():
-        mem, _ = model.encode(f, nt, s, bz, fd, made=torch.full((R,), made, device=dev), liked=torch.full((R,), liked, device=dev))
+        mem, _ = model.encode(f, nt, s, bz, fd, no_audio=(torch.arange(R, device=dev) >= heard) if heard else None,
+                              made=torch.full((R,), made, device=dev), liked=torch.full((R,), liked, device=dev))
     H = model.heads
     dh = mem.shape[-1] // H
     mem_cs = rope_at(torch.arange(T, device=dev)[None].expand(R, T), dh)
@@ -522,6 +527,8 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
                 x = x + blk.o2(blk.merge(F.scaled_dot_product_attention(q2.to(dt), mk, mv)))
                 x = x + blk.ff(blk.n3(x))
             logits = model.out(model.norm(x[:, 0])).float()
+        if heard:
+            logits = (logits[:heard] + audio * (logits[:heard] - logits[heard:])).repeat(2, 1)
         p = torch.softmax(logits / temp + bias[kind], -1)
         sp, si = torch.sort(p, -1, descending=True)
         if grouped:
@@ -538,6 +545,8 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
         c = sp.cumsum(-1)
         u = torch.rand(R, 1, device=dev) * c[:, -1:]
         tok = si.gather(1, (c < u).sum(-1, keepdim=True).clamp(max=n_out - 1))[:, 0]
+        if heard:
+            tok = tok[:heard].repeat(2)
         live = ~done
         out[ar, torch.where(live, n, maxlen)] = tok
         is_when, is_what, is_mot = kind == WHEN, kind == WHAT, kind == MOTION
@@ -574,7 +583,7 @@ def generate_batch(model, frames, notes, sec, busy, fade, temp=1.0, top_p=0.95, 
             break
     n = st["n"].tolist()
     o = out.cpu().numpy()
-    return [o[r, :n[r]].tolist() for r in range(R)]
+    return [o[r, :n[r]].tolist() for r in range(heard or R)]
 
 
 PIECE_EDGE = 64
@@ -650,7 +659,8 @@ def hold_outro(events, last, to, spb):
 
 
 def lightshows(model, logmel, fps, beat_times, offset, notes_list, bpm, seed=0, dev="cuda", tries=None, temp=1.0,
-               top_p=0.95, made=HAND, liked=LIKED, busy=True, fade="usual", end=None, song_end=None, grouped=True):
+               top_p=0.95, made=HAND, liked=LIKED, busy=True, fade="usual", end=None, song_end=None, grouped=True, audio=None):
+    audio = AUDIO if audio is None else audio
     ok = [i for i, nts in enumerate(notes_list) if len(nts)]
     shows = [[] for _ in notes_list]
     if not ok:
@@ -677,7 +687,7 @@ def lightshows(model, logmel, fps, beat_times, offset, notes_list, bpm, seed=0, 
             toks = generate_batch(model, frames[start * AUDIO_PER_BEAT:stop * AUDIO_PER_BEAT], np.stack(rows), sec[start:stop],
                                   [w if busy else float("nan") for w in want for _ in range(tries)],
                                   [float("nan") if fade is None else fade] * len(rows), temp=temp, top_p=top_p,
-                                  seed=seed + k + 1000 * r, dev=dev, made=made, liked=liked, grouped=grouped)
+                                  seed=seed + k + 1000 * r, dev=dev, made=made, liked=liked, grouped=grouped, audio=audio)
             for j in range(len(ok)):
                 for t in range(tries):
                     m = decode_show(toks[j * tries + t], model.vocab, stop - start)
