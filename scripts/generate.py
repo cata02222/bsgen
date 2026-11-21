@@ -92,12 +92,51 @@ def pick_levels(stars, made):
     return list(min(fits, key=lambda p: sum(near(s, lv) for s, lv in zip(stars, p)))), True
 
 
-def ogg_vorbis(path):
+def ogg_vorbis(path, lead=0.0):
     data = Path(path).read_bytes()
-    if data[:4] == b"OggS" and b"vorbis" in data[:64]:
+    if data[:4] == b"OggS" and b"vorbis" in data[:64] and not lead:
         return data
-    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-c:a", "libvorbis", "-q:a", "6", "-f", "ogg", "-"],
+    pad = ["-af", f"adelay={lead * 1000:.0f}:all=1"] if lead else []
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", *pad, "-c:a", "libvorbis", "-q:a", "6", "-f", "ogg", "-"],
                           capture_output=True, check=True).stdout
+
+
+LEAD_S = 2.0
+SOUND_DB = 30.0
+START_S = 1.5
+
+
+def sound_start(y, sr):
+    hop = max(int(sr * 0.05), 1)
+    n = len(y) // hop
+    if n < 2:
+        return 0.0
+    db = 10 * np.log10((np.asarray(y[:n * hop], np.float64).reshape(n, hop) ** 2).mean(1) + 1e-12)
+    loud = np.flatnonzero(db >= np.percentile(db, 75) - SOUND_DB)
+    return float(loud[0] * hop / sr) if len(loud) else 0.0
+
+
+LOUD_TARGET, LOUD_SLACK, LOUD_PEAK = -8.0, 1.0, 0.891
+
+
+def loudness(path):
+    import re
+    r = subprocess.run(["ffmpeg", "-nostats", "-hide_banner", "-i", str(path), "-vn", "-af", "ebur128", "-f", "null", "-"],
+                       capture_output=True)
+    m = re.search(r"I:\s+(-?[\d.]+) LUFS", r.stderr.decode(errors="replace").split("Summary:")[-1])
+    return float(m.group(1)) if m and r.returncode == 0 else None
+
+
+def level_audio(path, audio_bytes, log=print, lead=0.0):
+    lufs = loudness(path)
+    if lufs is None or lufs >= LOUD_TARGET - LOUD_SLACK:
+        return audio_bytes
+    gain = LOUD_TARGET - lufs
+    log(f"song: {lufs:.1f} LUFS, quieter than songs in maps usually are; raised {gain:.1f} dB")
+    pad = f"adelay={lead * 1000:.0f}:all=1," if lead else ""
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn",
+                           "-af", f"{pad}volume={gain:.2f}dB,alimiter=limit={LOUD_PEAK}:level=disabled:latency=1",
+                           "-c:a", "libvorbis", "-q:a", "6", "-f", "ogg", "-"], capture_output=True, check=True).stdout
 
 
 def parser():
@@ -129,7 +168,7 @@ def parser():
                     help="of those, take the one whose notes land on the strongest hits in the music")
     ap.add_argument("--off-grid", type=float, default=0.0,
                     help="penalty on notes off the 1/16-beat grid (triplets) where the music doesn't hit (0: off; ~3)")
-    ap.add_argument("--copy", type=float, default=0.0,
+    ap.add_argument("--copy", type=float, default=4.0,
                     help="logits toward the notes of an earlier part that sounds like this one, as human mappers repeat them (0: off)")
     ap.add_argument("--repeat", type=float, default=4.0,
                     help="keep a part that sounds like an earlier one to that part's off-beat family, straight or triplet, as human mappers do (0: off)")
@@ -360,7 +399,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         log(f"scene: {args.environment}")
 
     import librosa
-    picture, artist = None, ""
+    picture, artist, level_job = None, "", None
     if args.map:
         with beatmap.open_map(args.map) as z:
             info = beatmap.read_info(z)
@@ -380,8 +419,17 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
     else:
         audio_bytes = ogg_vorbis(args.audio)
         y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+        start = sound_start(y, sr)
+        lead = round(LEAD_S - start, 3) if start < LEAD_S else 0.0
+        if lead:
+            log(f"song: starts at {start:.2f} s; {lead:.2f} s of silence put before it, so the map doesn't start at once")
+            audio_bytes = ogg_vorbis(args.audio, lead)
+            y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+        pool = ThreadPoolExecutor(1)
+        level_job = pool.submit(level_audio, args.audio, audio_bytes, log, lead)
+        pool.shutdown(wait=False)
         title, artist, _, picture = artwork.song_info(args.audio)
-        bpm, first = args.bpm, (args.offset_ms or 0) / 1000
+        bpm, first = args.bpm, (args.offset_ms or 0) / 1000 + lead
         tempo = None
         if not bpm or args.offset_ms is None:
             logmel, fps = sample.song_mel(y, sr)
@@ -547,15 +595,17 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
                                     use_plan=not args.no_plan, hooks=hooks, gen=gen, rng=rng, floor=sample.xtc_floor(star), top=sample.top_bias(star), fast=star,
                                     progress=lambda beat: progress(name, beat, n_beats) if progress else None)
         bombs, walls, arcs = tokens.to_objects(ev, offset)
-        chains = tokens.to_chains(ev, offset)
         notes = tokens.to_notes(ev, offset)
         late = int((notes["beat"] > end_beat).sum())
         notes, bombs, walls = (x[x["beat"] <= end_beat] for x in (notes, bombs, walls))
         walls["duration"] = np.minimum(walls["duration"], end_beat - walls["beat"])
         arcs = arcs[arcs["tail_beat"] <= end_beat]
-        chains = chains[chains["beat"] <= end_beat]
         if not args.no_bombs:
             bombs = sample.reset_bombs(notes, bombs, walls, tempo.to_seconds, args.seed or 0)
+        start_beat = float(tempo.to_beats(np.array([START_S]))[0])
+        bombs, walls = bombs[bombs["beat"] >= start_beat], walls[walls["beat"] >= start_beat]
+        chains = tokens.to_chains(ev, offset, tempo.to_seconds, bombs, walls, args.seed or 0)
+        chains = chains[chains["beat"] <= end_beat]
         if late:
             say(f"{late} notes in the song's quiet ending left out")
         secs = tempo.to_seconds(notes["beat"])
@@ -682,7 +732,7 @@ def make_map(args, model=None, log=print, progress=None, player=None, lighter=No
         folder = folder.with_name(export.safe_name(f"{title[:40]} {tag} {n}"))
     cover, found_artist = artwork.finish(cover_job, log)
     artist = artist or found_artist or ""
-    export.write_pack(folder, audio_bytes, bpm, f"{title} (bsgen {stars[0]:g}★)" if len(stars) == 1 else f"{title} (bsgen)",
+    export.write_pack(folder, level_job.result() if level_job else audio_bytes, bpm, f"{title} (bsgen {stars[0]:g}★)" if len(stars) == 1 else f"{title} (bsgen)",
                       levels, tempo_changes=changes, fmt=args.format, cover=cover, artist=artist,
                       environment=args.environment)
     log(f"wrote {folder}")

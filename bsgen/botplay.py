@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ from .player import HZ, UNKNOWN, Player, objects_from_map, orthonormal, play
 
 BSOR_HEIGHT = 1.6
 _labeler = {}
+_labeler_lock = threading.Lock()
 
 
 def load_player(path, dev="cuda"):
@@ -27,6 +29,11 @@ def load_player(path, dev="cuda"):
 def swing_plan(notes, dev="cuda", bombs=None):
     if not len(notes):
         return np.zeros(0, np.int8)
+    with _labeler_lock:
+        return _swing_plan(notes, dev, bombs)
+
+
+def _swing_plan(notes, dev, bombs):
     if dev not in _labeler:
         path = hub.labeler_model()
         if path.suffix == ".safetensors":
@@ -76,6 +83,7 @@ def map_environment(zip_path):
 def write_replay(path, zip_path, difficulty, motion, info, njs, objects, player="bsgen bot", characteristic="Standard"):
     objects, _, _ = map_objects(zip_path, difficulty, characteristic)
     events = judge.note_events(judge.Notes(objects, njs), motion, BSOR_HEIGHT)
+    events += judge.bomb_events(judge.Bombs(objects, njs), motion)
     m = motion.reshape(-1, 3, 9).astype(np.float64)
     quat = Rotation.from_matrix(judge.rotations(m[..., 3:]).reshape(-1, 3, 3)).as_quat().reshape(-1, 3, 4)
     meta = {"player": player, "hash": bsor.map_hash(zip_path, info), "song": info.song_name,
@@ -87,13 +95,14 @@ def write_replay(path, zip_path, difficulty, motion, info, njs, objects, player=
 
 def summary(events):
     kinds = np.array([e[5] for e in events])
-    return {"notes": len(events), "good": int(np.sum(kinds == 0)), "bad": int(np.sum(kinds == 1)),
-            "missed": int(np.sum(kinds == 2)), "score": judge.replay_score(events)}
+    return {"notes": int(np.sum(kinds != 3)), "good": int(np.sum(kinds == 0)), "bad": int(np.sum(kinds == 1)),
+            "missed": int(np.sum(kinds == 2)), "bombs": int(np.sum(kinds == 3)), "score": judge.replay_score(events)}
 
 
 def describe(s):
     return (f"{s['good']} of {s['notes']} notes cut, {s['bad']} bad cut{'s' * (s['bad'] != 1)}, "
-            f"{s['missed']} missed, score {s['score']}")
+            f"{s['missed']} missed" + (f", {s['bombs']} bomb{'s' * (s['bombs'] != 1)} hit" if s.get("bombs") else "")
+            + f", score {s['score']}")
 
 
 TOUCH_BEFORE, TOUCH_AFTER = 24, 18

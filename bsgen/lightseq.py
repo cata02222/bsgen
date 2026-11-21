@@ -292,7 +292,7 @@ def generate(model, frames, notes, sec, busy=float("nan"), fade=float("nan"), te
     f = torch.from_numpy(np.asarray(frames, np.float32))[None].to(dev)
     nt = torch.from_numpy(np.asarray(notes, np.int64))[None].to(dev)
     s = torch.from_numpy(np.asarray(sec, np.float32))[None].to(dev)
-    with torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda")):
+    with torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda"), cache_enabled=False):
         mem, _ = model.encode(f, nt, s, torch.tensor([busy], device=dev), torch.tensor([fade], device=dev))
     mem_cs = rope_at(torch.arange(T, device=dev)[None], mem.shape[-1] // model.heads)
     caches = [dict() for _ in model.dec]
@@ -304,7 +304,7 @@ def generate(model, frames, notes, sec, busy=float("nan"), fade=float("nan"), te
         nonlocal prev
         note = int(notes[b, t]) if kind == WHAT else 0
         args = [torch.tensor([v], device=dev) for v in (prev, kind, b, t, note)]
-        with torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda")):
+        with torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda"), cache_enabled=False):
             logits = model.step(mem, mem_cs, *args, caches)[0].float()
         lo, hi = ranges[kind]
         z = torch.full_like(logits, -float("inf"))

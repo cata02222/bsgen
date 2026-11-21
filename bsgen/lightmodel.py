@@ -246,7 +246,7 @@ def lightshow(model, logmel, fps, beat_times, offset, notes, env="DefaultEnviron
         masked = x == MASK
         total = int(masked.sum())
         for k in range(steps):
-            with torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda")):
+            with torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda"), cache_enabled=False):
                 logits = model(x, n, a, e, beat0, *kind, s)
             p = torch.softmax(logits / temp, -1)
             if min_p:

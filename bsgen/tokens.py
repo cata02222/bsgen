@@ -320,11 +320,44 @@ def to_notes(ev, grid_offset):
     return out
 
 
-def to_chains(ev, grid_offset):
+CHAIN_FRACTIONS = np.array([0, 1 / 32, 1 / 24, 1 / 16, 1 / 12, 1 / 8, 1 / 6, 1 / 4])
+CHAIN_BPM_BANDS = (150, 200, 260)
+CHAIN_LENGTH_WEIGHTS = np.array([
+    [0.157, 0.181, 0.169, 0.317, 0.111, 0.057, 0.002, 0.007],
+    [0.177, 0.117, 0.181, 0.230, 0.042, 0.224, 0.010, 0.021],
+    [0.014, 0.098, 0.097, 0.178, 0.339, 0.162, 0.025, 0.087],
+    [0.000, 0.031, 0.000, 0.077, 0.038, 0.843, 0.011, 0.000]])
+CHAIN_LINKS = {"none": {4: 0.07, 5: 0.55, 7: 0.07, 8: 0.07},
+               "one": {2: 0.03, 3: 0.29, 4: 0.34, 5: 0.29, 6: 0.03},
+               "far": {3: 0.14, 4: 0.22, 5: 0.40, 6: 0.12, 7: 0.07, 8: 0.015}}
+CHAIN_SQUISHES = {1.0: 0.80, 0.8: 0.07, 0.9: 0.02, 0.7: 0.02, 0.6: 0.025, 0.5: 0.022, 1.1: 0.011, 1.2: 0.016}
+CHAIN_TAILS = {False: {(1, 0): 0.686, (2, 0): 0.214, (2, 1): 0.035, (2, -1): 0.035},
+               True: {(2, 0): 0.403, (3, -1): 0.278, (3, 1): 0.267, (4, 0): 0.014}}
+CHAIN_KEEP = 0.64
+CHAIN_CLEAR_S = 0.25
+
+
+def _draw(rng, weights):
+    keys = list(weights)
+    p = np.array([weights[k] for k in keys], np.float64)
+    return keys[rng.choice(len(keys), p=p / p.sum())]
+
+
+def _chain_cells(x, y, tx, ty, links):
+    out = set()
+    for u in np.linspace(0, 1, max(links, 2))[1:]:
+        px, py = x + (tx - x) * u, y + (ty - y) * u
+        out |= {(int(np.floor(a + 0.5)), int(np.floor(b + 0.5))) for a in (px - 0.3, px + 0.3) for b in (py - 0.3, py + 0.3)}
+    return out - {(x, y)}
+
+
+def to_chains(ev, grid_offset, seconds=None, bombs=None, walls=None, seed=0):
     from .beatmap import CHAIN_DTYPE
     notes = ev[ev["kind"] == NOTE]
-    out = []
-    for c in ev[ev["kind"] == CHAIN]:
+    rng = np.random.default_rng(seed)
+    out, last = [], None
+    nb = notes["tick"] / TICKS + grid_offset
+    for c in np.sort(ev[ev["kind"] == CHAIN], order=["tick", "hand"]):
         head = notes[(notes["tick"] == c["tick"]) & (notes["hand"] == c["hand"])]
         if len(head) != 1 or int(head[0]["dir"]) not in DIR_STEP:
             continue
@@ -334,8 +367,66 @@ def to_chains(ev, grid_offset):
         if not (0 <= tx <= 3 and 0 <= ty <= 2):
             tx, ty = x, y
         beat = c["tick"] / TICKS + grid_offset
-        out.append((beat, int(c["hand"]), x, y, d, beat + CHAIN_BEATS, tx, ty, CHAIN_SLICES, CHAIN_SQUISH))
+        if seconds is None:
+            out.append((beat, int(c["hand"]), x, y, d, beat + CHAIN_BEATS, tx, ty, CHAIN_SLICES, CHAIN_SQUISH))
+            continue
+        spb = float(seconds(beat + 0.5) - seconds(beat - 0.5))
+        clear = CHAIN_CLEAR_S / max(spb, 1e-3)
+
+        def busy(cx, cy):
+            near = lambda b, a=-1e-6: (b >= beat + a) & (b <= beat + clear)
+            cell = cy * 4 + cx
+            n = near(nb) & (notes["cell"] == cell) & ~((notes["tick"] == c["tick"]) & (notes["hand"] == c["hand"]))
+            if n.any():
+                return True
+            if bombs is not None and len(bombs) and (near(bombs["beat"], -0.1 / max(spb, 1e-3)) & (bombs["line"] == cx) & (bombs["layer"] == cy)).any():
+                return True
+            if walls is not None and len(walls):
+                w = walls[(walls["beat"] <= beat + clear) & (walls["beat"] + walls["duration"] >= beat)
+                          & (walls["line"] <= cx) & (walls["line"] + walls["width"] > cx)
+                          & (walls["layer"] <= cy) & (walls["layer"] + walls["height"] > cy)]
+                if len(w):
+                    return True
+            return False
+
+        if last is not None and (last[0] == c["tick"] or rng.random() < CHAIN_KEEP):
+            length, links, squish = last[1:]
+        else:
+            band = int(np.searchsorted(CHAIN_BPM_BANDS, 60.0 / max(spb, 1e-3), side="right"))
+            w = CHAIN_LENGTH_WEIGHTS[band]
+            length = float(CHAIN_FRACTIONS[rng.choice(len(w), p=w / w.sum())])
+            links, squish = None, _draw(rng, CHAIN_SQUISHES)
+        diag = dx != 0 and dy != 0
+        tails = dict(CHAIN_TAILS[diag])
+        n2 = dx * dx + dy * dy
+        while tails:
+            a, cr = _draw(rng, tails)
+            del tails[(a, cr)]
+            ox, oy = (a * dx + cr * dy) // n2, (a * dy - cr * dx) // n2
+            one = (a, cr) == ((2, 0) if diag else (1, 0))
+            k = links or _draw(rng, CHAIN_LINKS["none" if length == 0 else "one" if one else "far"])
+            ux, uy = x + ox, y + oy
+            if 0 <= ux <= 3 and 0 <= uy <= 2 and not any(busy(*q) for q in _chain_cells(x, y, ux, uy, k)):
+                tx, ty, links = ux, uy, k
+                break
+        if links is None:
+            links = _draw(rng, CHAIN_LINKS["none" if length == 0 else "one"])
+        out.append((beat, int(c["hand"]), x, y, d, beat + length, tx, ty, links, squish))
+        last = (int(c["tick"]), length, links, squish)
     return np.array(out, CHAIN_DTYPE) if out else np.zeros(0, CHAIN_DTYPE)
+
+
+def arc_end(stack, other, last):
+    if len(stack) < 2:
+        return stack[0]
+    x, y = stack["cell"] % 4, stack["cell"] // 4
+    arrows = [int(d) for d in stack["dir"] if int(d) in DIR_STEP]
+    if arrows:
+        dx, dy = DIR_STEP[arrows[0]]
+        along = x * dx + y * dy
+        return stack[int(np.argmax(along) if last else np.argmin(along))]
+    ox, oy = (other["cell"] % 4).mean(), (other["cell"] // 4).mean()
+    return stack[int(np.argmin((x - ox) ** 2 + (y - oy) ** 2))]
 
 
 def to_objects(ev, grid_offset):
@@ -357,7 +448,7 @@ def to_objects(ev, grid_offset):
         if not len(tail) or not len(before):
             continue
         head = before[before["tick"] == before["tick"].max()]
-        hd, td = head[0], tail[0]
+        hd, td = arc_end(head, tail, last=True), arc_end(tail, head, last=False)
         arcs.append((beat(hd["tick"]), a["hand"], hd["cell"] % 4, hd["cell"] // 4, hd["dir"], 1.0,
                      beat(td["tick"]), td["cell"] % 4, td["cell"] // 4, td["dir"], 1.0, 0))
     return bombs, walls, np.array(arcs, ARC_DTYPE) if arcs else np.zeros(0, ARC_DTYPE)

@@ -283,7 +283,8 @@ def to_objects(ev, grid_offset):
         if not len(tail) or not len(before):
             continue
         head = before[before["tick"] == before["tick"].max()]
-        hd, td = head[0], tail[0]
+        from ..tokens import arc_end
+        hd, td = arc_end(head, tail, last=True), arc_end(tail, head, last=False)
         arcs.append((beat(hd["tick"]), a["hand"], hd["cell"] % 4, hd["cell"] // 4, hd["dir"], 1.0,
                      beat(td["tick"]), td["cell"] % 4, td["cell"] // 4, td["dir"], 1.0, 0))
     return bombs, walls, np.array(arcs, ARC_DTYPE) if arcs else np.zeros(0, ARC_DTYPE)

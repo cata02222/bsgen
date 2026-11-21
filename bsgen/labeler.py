@@ -102,7 +102,7 @@ def predict(model, notes, dev="cuda", bombs=None):
 
 
 def label(model, notes, dev="cuda", quick_reset=0.0, bombs=None):
-    with torch.autocast("cuda", torch.bfloat16, enabled=dev == "cuda"):
+    with torch.autocast("cuda", torch.bfloat16, enabled=dev == "cuda", cache_enabled=False):
         logits = predict(model, notes, dev, bombs)
     lab = logits.argmax(1)
     rule = parity_rule(notes)

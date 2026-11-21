@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-MAX_MINUTES = 15
+MAX_MINUTES = 90
 HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 
 
@@ -115,12 +115,15 @@ def _retag(path, info):
 
 
 def _fetch(yt_dlp, target, folder, extra):
+    why = []
+
     def reject(info, incomplete=False):
         if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
-            return "a live stream"
-        if (info.get("duration") or 0) > MAX_MINUTES * 60:
-            return f"longer than {MAX_MINUTES} minutes"
-        return None
+            why.append("That's a live stream; only finished videos can be used.")
+        elif (info.get("duration") or 0) > MAX_MINUTES * 60:
+            why.append(f"That video is {info['duration'] / 60:.0f} minutes long; links can be up to {MAX_MINUTES} "
+                       "minutes. For a longer song, upload the audio file instead.")
+        return why[-1] if why else None
 
     opts = {
         "format": "bestaudio/best", "noplaylist": True, "logger": _Silent(), "socket_timeout": 20,
@@ -134,6 +137,8 @@ def _fetch(yt_dlp, target, folder, extra):
             info = ydl.extract_info(target, download=True)
     except yt_dlp.utils.DownloadError as e:
         return None, re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+    if why:
+        raise YouTubeError(why[-1])
     if info and "entries" in info:
         info = next(iter(info["entries"]), None)
     if not info:

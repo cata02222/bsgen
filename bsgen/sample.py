@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import checks
 from . import pattern as pattern_levels
 from . import tokens
 from .data import (AHEAD, HIT_SLOTS, MEM_BEATS, REPEAT_SIM, SLOT_TICKS, beat_mel, beat_prints, beat_to_sec, best_match, hit_roll, memory_input, memory_match,
@@ -105,6 +106,10 @@ def _comes_through(c, o, d):
 
 CLASH = [[[_comes_through(c, o, d) for d in range(9)] for o in range(12)] for c in range(12)]
 
+PAIR_BAD = [CLASH[c][o][d] or CLASH[o][c][od] or checks.clap(c % 4, c // 4, d, o % 4, o // 4, od)
+            or checks.in_path(c % 4, c // 4, d, o % 4, o // 4, od)
+            for c in range(12) for d in range(9) for o in range(12) for od in range(9)]
+
 
 def _chain_tail(c, d):
     if d not in tokens.DIR_STEP:
@@ -151,6 +156,15 @@ def near_gap_ticks(beat_times):
 
 
 VISION_GAP_S = 0.3
+VISION_STARS, VISION_S = [3.5, 6.5, 9.5, 12.5], [0.5, 0.45, 0.4, 0.35]
+
+STAIR_S = 0.15
+STEP_XY = {0: (0, 1), 1: (0, -1), 2: (-1, 0), 3: (1, 0), 4: (-1, 1), 5: (1, 1), 6: (-1, -1), 7: (1, -1)}
+STAIR_CELL = [[-1] * 9 for _ in range(12)]
+for _c in range(12):
+    for _d, (_dx, _dy) in STEP_XY.items():
+        _x, _y = _c % 4 + _dx, _c // 4 + _dy
+        STAIR_CELL[_c][_d] = _y * 4 + _x if 0 <= _x < 4 and 0 <= _y < 3 else -1
 
 
 CROSS_GAP_S = 0.2
@@ -172,9 +186,15 @@ def cross_args(beat_times, stars):
     return int(round(CROSS_GAP_S / spb * TICKS)), at(CROSS_RATES), at(PAIR_OFF), at(PAIR_CROSSED)
 
 
-def vision_gap_ticks(beat_times):
+def vision_gap_ticks(beat_times, stars=None):
     spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
-    return int(np.ceil(VISION_GAP_S / spb * TICKS))
+    sec = VISION_GAP_S if stars is None else float(np.interp(stars, VISION_STARS, VISION_S))
+    return int(np.ceil(sec / spb * TICKS))
+
+
+def stair_gap_ticks(beat_times):
+    spb = float(np.median(np.diff(beat_times))) if len(beat_times) > 1 else 0.5
+    return int(np.ceil(STAIR_S / spb * TICKS))
 
 
 WALL_SWITCH_S = 0.60
@@ -451,7 +471,8 @@ class Rules:
     def __init__(self, prefix_events, end_tick, swings=True, objects=OBJ_WALLS | OBJ_BOMBS | OBJ_ARCS,
                  max_loop=MAX_LOOP, behind=TICKS // 2, dry=0.0, turn=0.0, copy=None, hold=0.0, times=None,
                  double_gap=0, cell_gap=0, swing_gap=SWING_GAP, uncross=False, near_gap=0, wall_gap=0, vision_gap=0,
-                 slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0), hand=(0, 0, 0), air_any=0, double_floor=0, cross=(0, 0, 0, 0)):
+                 slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0), hand=(0, 0, 0), air_any=0, double_floor=0, cross=(0, 0, 0, 0), stair_gap=0):
+        self.stair_gap, self.stair = stair_gap, {0: None, 1: None}
         self.cross_gap, self.cross_rate, self.pair_off, self.pair_crossed = cross
         self.notes_n = self.cross_n = 0
         self.pairs_n = self.pairs_off = self.pairs_crossed = 0
@@ -530,6 +551,7 @@ class Rules:
                 self.cell_tick[int(e["cell"])] = self.tick
                 self.cut_tick[h] = self.tick
                 self._col(h, int(e["cell"]))
+                self._stair(h, int(e["cell"]))
                 self._rest(h, int(e["dir"]))
                 self.stack[h] += 1
                 self.note_ticks.append(self.tick)
@@ -811,6 +833,10 @@ class Rules:
         if t >= 0:
             self.chain_cells.add(t)
 
+    def _stair(self, h, cell):
+        d = self.swing_dir[h]
+        self.stair[h] = (self.tick, STAIR_CELL[cell][d[0]]) if d is not None else None
+
     def _col(self, h, cell):
         if cell in (5, 6):
             self.front_tick[h] = (self.tick, cell)
@@ -825,12 +851,20 @@ class Rules:
         near = near[1] if near and self.near_gap and 0 < self.tick - near[0] < self.near_gap else None
         front = self.front_tick[1 - h]
         hidden = self.vision_gap and front is not None and 0 < self.tick - front[0] < self.vision_gap
-        if not other and not near and not hidden:
+        mine = self.front_tick[h]
+        mine = mine if first and self.vision_gap and mine is not None and 0 < self.tick - mine[0] < self.vision_gap else None
+        stair = self.stair[1 - h]
+        stair = stair[1] if self.stair_gap and stair is not None and 0 < self.tick - stair[0] < self.stair_gap else -1
+        if not other and not near and not hidden and not mine and stair < 0:
             return cells
         own = [c % 4 for g, c in self.cells if g == h]
 
         def fine(c):
             if hidden and (c % 4 <= 1) == (front[1] == 5):
+                return False
+            if mine and (c % 4 <= 1) == (mine[1] == 5):
+                return False
+            if c == stair:
                 return False
             if near and (c % 4 >= min(near) if h == 0 else c % 4 <= max(near)):
                 return False
@@ -850,10 +884,12 @@ class Rules:
         (x0, y0), (x1, y1) = (own[0] % 4, own[0] // 4), (own[1] % 4, own[1] // 4)
         return {c for c in cells if (c % 4 - x0) * (y1 - y0) == (c // 4 - y0) * (x1 - x0)}
 
-    def _put(self, ok, h, cells, dirs, first=False):
-        other = [(o // 9, o % 9) for o in self.notes_now[1 - h]]
+    def _put(self, ok, h, cells, dirs, first=False, wide=None):
+        other = list(self.notes_now[1 - h])
         pairs = [(c, d) for c in cells for d in dirs
-                 if not any(CLASH[c][o][d] or CLASH[o][c][od] for o, od in other)]
+                 if not any(PAIR_BAD[(c * 9 + d) * 108 + o] for o in other)]
+        if first and not pairs and wide is not None:
+            pairs = [(c, d) for c in wide for d in dirs if not any(PAIR_BAD[(c * 9 + d) * 108 + o] for o in other)]
         if first and not pairs:
             pairs = [(c, d) for c in cells for d in dirs]
         for c, d in pairs:
@@ -925,7 +961,8 @@ class Rules:
             dirs = (FOREHAND_DIRS if self.face[h] else BACKHAND_DIRS)[h]
             if not self.opened[h]:
                 dirs = dirs & OPENING_DIRS
-            self._put(ok, h, self._sides(h, self._free(self.behind, notes=True)), self.fit(h, dirs), first=True)
+            free = self._free(self.behind, notes=True)
+            self._put(ok, h, self._sides(h, free), self.fit(h, dirs), first=True, wide=free)
             return ok
         if self.floor_now and (left := self._free() & FLOOR_CELLS):
             for cell in left:
@@ -1053,6 +1090,7 @@ class Rules:
                 self.first_dir[h] = j % 9
             if j % 9 != 8:
                 self.swing_dir[h] = (j % 9, self.tick)
+            self._stair(h, j // 9 % 12)
             self.need_note = None
             self.note_ticks.append(self.tick)
             self._hit()
@@ -1091,8 +1129,9 @@ def native_consts():
             arc_shape=[float(x) for x in ARC_SHAPE],
             durations=[int(d) for d in tokens.DURATIONS],
             dir_angle=[DIR_ANGLE[d] for d in range(8)],
-            clash=[CLASH[c][o][d] for c in range(12) for o in range(12) for d in range(9)],
+            clash=list(PAIR_BAD),
             chain_tail=[CHAIN_TAIL[c][d] for c in range(12) for d in range(9)],
+            stair_cell=[STAIR_CELL[c][d] for c in range(12) for d in range(9)],
             dir_sin=[float(np.sin(np.radians(DIR_ANGLE[d]))) for d in range(8)],
             dir_cos=[float(np.cos(np.radians(DIR_ANGLE[d]))) for d in range(8)])
     scalars = dict(
@@ -1121,7 +1160,7 @@ def native_consts():
 
 def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry, turn, copy, hold, times,
                  double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap=0, floor=(0, 0, 0), fast=(0, 0, 0),
-                 hand=(0, 0, 0), air_any=0, double_floor=0, cross=(0, 0, 0, 0)):
+                 hand=(0, 0, 0), air_any=0, double_floor=0, cross=(0, 0, 0, 0), stair_gap=0):
     e = prefix_events
     return NATIVE.Rules(native_consts(), e["tick"], e["kind"], e["hand"], e["forehand"], e["air"], e["cell"],
                         e["dir"], e["shape"], e["dur"], int(end_tick), bool(swings), int(objects), int(max_loop),
@@ -1129,7 +1168,7 @@ def native_rules(prefix_events, end_tick, swings, objects, max_loop, behind, dry
                         float(hold), None if times is None else [int(t) for t in times], int(double_gap),
                         int(cell_gap), int(swing_gap), bool(uncross), int(near_gap), int(wall_gap), int(vision_gap),
                         int(slide_gap), *(int(x) for x in floor), *(int(x) for x in (tuple(fast) + (0,))[:4]), *(int(x) for x in hand), int(air_any),
-                        int(double_floor), *(int(x) for x in cross))
+                        int(double_floor), *(int(x) for x in cross), int(stair_gap))
 
 
 GRAPHS = True
@@ -1563,7 +1602,8 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
     ov, bar = song_overview(logmel, fps, beat_times, offset)
     behind = behind_wall_ticks((c.get("njs") if getattr(model, "controls", False) else None) or 18.0, beat_times)
     double_gap, cell_gap, near_gap = double_gap_ticks(beat_times), cell_gap_ticks(beat_times), near_gap_ticks(beat_times)
-    vision_gap = vision_gap_ticks(beat_times)
+    vision_gap = vision_gap_ticks(beat_times, stars)
+    stair_gap = stair_gap_ticks(beat_times)
     wall_gap = wall_switch_ticks(beat_times)
     swing_gap = swing_gap_ticks(beat_times, stars)
     slide_gap = slide_gap_ticks(beat_times)
@@ -1653,7 +1693,7 @@ def generate(model, logmel, fps, beat_times, offset, n_beats, stars, cfg=1.5, te
             for _ in range(candidates):
                 r = make_rules(ev, end, swings, allow, max_loop, behind, dry, turn_now, copy, hold, times,
                                double_gap, cell_gap, swing_gap, uncross, near_gap, wall_gap, vision_gap, slide_gap, floor_now, fast_row, hand_now, air_any,
-                               double_floor, cross)
+                               double_floor, cross, stair_gap)
                 r.begin(t0, new0 - 1)
                 rules.append(r)
             boost = arc_boost

@@ -253,9 +253,9 @@ class Status:
                 self.scene = next((name for name, e in SCENES.items() if e == env), env).replace(" (default)", "")
             elif line == "making the lights":
                 self.phase = "Making the lights"
-            elif line.startswith("song:"):
+            elif m := re.match(r"song: ([\d.]+) s, \d+ beats", line):
                 self.phase = "Making the map"
-                self.song = float(line.split()[1])
+                self.song = float(m[1])
             elif m := re.match(r"(\w+): remaking, rated ([\d.]+)★ of ([\d.]+) asked", line):
                 how = "hard" if float(m[2]) > float(m[3]) else "easy"
                 self.notes.append(f"{self.NAMES.get(m[1], m[1])} came out too {how} ({float(m[2]):g}★ for "

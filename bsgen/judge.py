@@ -5,7 +5,7 @@ import threading
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from .player import BLUE, CHAIN_HEAD, CHAIN_LINK, DIM, RED, WALL, as_objects
+from .player import BLUE, BOMB, CHAIN_HEAD, CHAIN_LINK, DIM, RED, WALL, as_objects
 
 FPS = 60
 NOTE_DEPTH = 0.9
@@ -21,6 +21,7 @@ SEEN = (-0.5, 4.0)
 BLADE_POINTS = np.linspace(0, 1, 5, dtype=np.float32)
 WALL_BOTTOM = FIRST_ROW - ROW / 2
 WALL_SIDE = -1.2
+BOMB_RADIUS, BOMB_FRAMES = 0.18, 4
 
 
 def rotations(sixd):
@@ -63,6 +64,52 @@ class Notes:
 
     def __len__(self):
         return len(self.time)
+
+
+class Bombs:
+
+    def __init__(self, objects, njs):
+        objects = as_objects(objects)
+        b = objects[objects["kind"] == BOMB]
+        self.time = b["time"].astype(np.float64)
+        self.line, self.layer = b["line"].astype(np.int64), b["layer"].astype(np.int64)
+        self.centre = np.stack([LANES[np.clip(self.line, 0, 3)] + LANE * b["offset_x"],
+                                FIRST_ROW + ROW * (np.clip(self.layer, 0, 2) + b["offset_y"])], 1).astype(np.float64)
+        self.njs = float(njs)
+
+    def __len__(self):
+        return len(self.time)
+
+
+def bomb_hits(bombs, motion, t0, first=1):
+    C, n = motion.shape[:2]
+    out = np.full((C, len(bombs)), -1)
+    f = np.round((bombs.time - t0) * FPS).astype(int)
+    first = max(first, 1)
+    near = np.flatnonzero((f + BOMB_FRAMES > first) & (f - BOMB_FRAMES < n))
+    if not len(near):
+        return out
+    hilt, blade = tips(np.asarray(motion, np.float64))
+    pts = hilt[..., None, :] + blade[..., None, :] * BLADE_POINTS[:, None]
+    for k in near:
+        fr = np.arange(max(f[k] - BOMB_FRAMES, first), min(f[k] + BOMB_FRAMES, n))
+        if not len(fr):
+            continue
+        z = NOTE_DEPTH + bombs.njs * (bombs.time[k] - (t0 + (fr - 0.5) / FPS))
+        c = np.concatenate([np.broadcast_to(bombs.centre[k], (len(fr), 2)), z[:, None]], 1)[None, :, None, None]
+        p0, p1 = pts[:, fr - 1], pts[:, fr]
+        d = p1 - p0
+        u = np.clip(((c - p0) * d).sum(-1) / np.maximum((d * d).sum(-1), 1e-12), 0, 1)
+        hit = (np.linalg.norm(p0 + u[..., None] * d - c, axis=-1) < BOMB_RADIUS).any((2, 3))
+        any_ = hit.any(1)
+        out[any_, k] = fr[hit.argmax(1)][any_]
+    return out
+
+
+def bomb_events(bombs, motion):
+    first = bomb_hits(bombs, np.asarray(motion)[None], 0.0)[0]
+    return [(float(bombs.time[k]), int(bombs.line[k]), int(bombs.layer[k]), -1, 9, 3, float(first[k] / FPS), -1, 0.0,
+             0.0, 0.0, 0.0, np.zeros(3), np.zeros(3), 2) for k in np.flatnonzero(first >= 0)]
 
 
 class Result:
@@ -213,6 +260,7 @@ class Judge:
 
     def __init__(self, objects, njs):
         self.notes = Notes(objects, njs)
+        self.bombs = Bombs(objects, njs)
         self.done = np.zeros(len(self.notes), bool)
         self.times = self.notes.time
         self.last = self.cut = None
@@ -228,7 +276,7 @@ class Judge:
         skip = max(start - k - 1, 0)
         if traj.shape[1] <= skip + 1:
             self.last = self.cut = None
-            self.short = np.zeros(C)
+            self.short = self.bombs_hit = np.zeros(C)
             return np.zeros(C)
         r = simulate(self.notes, traj, k / FPS)
         r.good, r.bad, r.in_wall = r.good[:, skip:], r.bad[:, skip:], r.in_wall[:, skip:]
@@ -239,9 +287,10 @@ class Judge:
         self.ids, self.last = r.ids, cut | wrong
         in_wall = r.in_wall.sum(1)
         close = wall_closeness(self.notes, traj[:, skip + 1:], (k + skip + 1) / FPS).sum(1)
-        self.cut, self.clean_run = cut, ~wrong.any(1) & (in_wall == 0)
+        self.bombs_hit = (bomb_hits(self.bombs, traj, k / FPS, skip + 1) >= 0).sum(1) if len(self.bombs) else np.zeros(C)
+        self.cut, self.clean_run = cut, ~wrong.any(1) & (in_wall == 0) & (self.bombs_hit == 0)
         self.short = self._short(cands, past, r.ids, cut, fg)
-        return cut.sum(1) - wrong.sum(1) - (in_wall + close) / self.WALL_FRAMES
+        return cut.sum(1) - wrong.sum(1) - self.bombs_hit - (in_wall + close) / self.WALL_FRAMES
 
     def _short(self, cands, past, ids, cut, fg):
         C = len(cands)

@@ -31,6 +31,7 @@ struct Consts {
     slide_ok: Vec<bool>,
     clash: Vec<bool>,
     chain_tail: Vec<i64>,
+    stair_cell: Vec<i64>,
     slide_turn: i64,
     forehand: [u16; 2],
     backhand: [u16; 2],
@@ -134,6 +135,7 @@ impl NativeConsts {
             slide_ok: get(d, "slide_ok")?,
             clash: get(d, "clash")?,
             chain_tail: get(d, "chain_tail")?,
+            stair_cell: get(d, "stair_cell")?,
             slide_turn: get(d, "slide_turn")?,
             forehand: get::<Vec<Vec<i64>>>(d, "forehand")?.iter().map(|v| bits(v)).collect::<Vec<_>>().try_into().map_err(|_| PyValueError::new_err("forehand: 2 hands"))?,
             backhand: get::<Vec<Vec<i64>>>(d, "backhand")?.iter().map(|v| bits(v)).collect::<Vec<_>>().try_into().map_err(|_| PyValueError::new_err("backhand: 2 hands"))?,
@@ -359,6 +361,8 @@ struct State {
     near_gap: i64,
     wall_gap: i64,
     vision_gap: i64,
+    stair_gap: i64,
+    stair: [Option<(i64, i64)>; 2],
     front_tick: [Option<(i64, i64)>; 2],
     cols: [Option<(i64, u8)>; 2],
     moments_n: i64,
@@ -593,6 +597,11 @@ impl State {
         }
     }
 
+    fn set_stair(&mut self, h: usize, cell: i64) {
+        let t = self.tick.unwrap();
+        self.stair[h] = self.swing_dir[h].map(|(d, _)| (t, self.c.stair_cell[cell as usize * 9 + d as usize]));
+    }
+
     fn col(&mut self, h: usize, cell: i64) {
         let t = self.tick.unwrap();
         if cell == 5 || cell == 6 {
@@ -640,13 +649,24 @@ impl State {
             _ => None,
         };
         let front = self.front_tick[1 - h].filter(|&(f, _)| self.vision_gap != 0 && 0 < t - f && t - f < self.vision_gap);
-        if other.is_empty() && near.is_none() && front.is_none() {
+        let mine = self.front_tick[h].filter(|&(f, _)| first && self.vision_gap != 0 && 0 < t - f && t - f < self.vision_gap);
+        let stair = match self.stair[1 - h] {
+            Some((f, cl)) if self.stair_gap != 0 && 0 < t - f && t - f < self.stair_gap => cl,
+            _ => -1,
+        };
+        if other.is_empty() && near.is_none() && front.is_none() && mine.is_none() && stair < 0 {
             return cells;
         }
         let own: Vec<i64> = self.cells.iter().filter(|&&(g, _)| g as usize == h).map(|&(_, c)| c as i64 % 4).collect();
         let fine = |c: i64| -> bool {
             let col = c % 4;
             if front.is_some_and(|(_, cell)| (col <= 1) == (cell == 5)) {
+                return false;
+            }
+            if mine.is_some_and(|(_, cell)| (col <= 1) == (cell == 5)) {
+                return false;
+            }
+            if c == stair {
                 return false;
             }
             if let Some(m) = near {
@@ -686,15 +706,17 @@ impl State {
             .fold(0u16, |m, c| m | 1 << c)
     }
 
-    fn put(&self, ok: &mut [bool], h: usize, cells: u16, dirs: u16, first: bool) {
+    fn put(&self, ok: &mut [bool], h: usize, cells: u16, dirs: u16, first: bool, wide: u16) {
         let c = &self.c;
         let clear = |cl: usize, d: usize| {
-            self.notes_now[1 - h].iter().all(|&o| {
-                let (o, od) = ((o / 9) as usize, (o % 9) as usize);
-                !c.clash[(cl * 12 + o) * 9 + d] && !c.clash[(o * 12 + cl) * 9 + od]
-            })
+            self.notes_now[1 - h].iter().all(|&o| !c.clash[(cl * 9 + d) * 108 + o as usize])
         };
-        let any = ones(cells, 12).any(|cl| ones(dirs, 9).any(|d| clear(cl, d)));
+        let mut cells = cells;
+        let mut any = ones(cells, 12).any(|cl| ones(dirs, 9).any(|d| clear(cl, d)));
+        if first && !any && ones(wide, 12).any(|cl| ones(dirs, 9).any(|d| clear(cl, d))) {
+            cells = wide;
+            any = true;
+        }
         for cl in ones(cells, 12) {
             for d in ones(dirs, 9) {
                 if (first && !any) || clear(cl, d) {
@@ -856,7 +878,8 @@ impl State {
             if !self.opened[h] {
                 dirs &= c.opening;
             }
-            self.put(&mut ok, h, self.sides(h, self.free(self.behind, true), true), self.fit(h, dirs), true);
+            let free = self.free(self.behind, true);
+            self.put(&mut ok, h, self.sides(h, free, true), self.fit(h, dirs), true, free);
             return ok;
         }
         if self.floor_now {
@@ -1000,7 +1023,7 @@ impl State {
                     self.line(h, self.sides(h, note_free, false)),
                     self.fit(h, if f { c.forehand[h] } else { c.backhand[h] }),
                 );
-                self.put(&mut ok, h, cells, dirs, false);
+                self.put(&mut ok, h, cells, dirs, false, 0);
             }
         }
         ok
@@ -1291,6 +1314,7 @@ impl State {
             if d != 8 {
                 self.swing_dir[h] = Some((d, tick));
             }
+            self.set_stair(h, cell);
             self.need_note = None;
             self.note_ticks.push(tick);
             self.hit_now();
@@ -1344,7 +1368,7 @@ impl Rules {
     #[new]
     #[pyo3(signature = (consts, tick, kind, hand, forehand, air, cell, dir, shape, dur, end_tick, swings, objects,
                         max_loop, behind, dry, turn, copy, hold, times, double_gap, cell_gap, swing_gap, uncross, near_gap,
-                        wall_gap, vision_gap, slide_gap, floor_rate, floor_min, floor_far, fast_cap, fast_gap, fast_span, air_cue, hand_cap, hand_gap, hand_span, air_any, double_floor, cross_gap=0, cross_rate=0, pair_off=0, pair_crossed=0))]
+                        wall_gap, vision_gap, slide_gap, floor_rate, floor_min, floor_far, fast_cap, fast_gap, fast_span, air_cue, hand_cap, hand_gap, hand_span, air_any, double_floor, cross_gap=0, cross_rate=0, pair_off=0, pair_crossed=0, stair_gap=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         consts: &NativeConsts,
@@ -1391,6 +1415,7 @@ impl Rules {
         cross_rate: i64,
         pair_off: i64,
         pair_crossed: i64,
+        stair_gap: i64,
     ) -> PyResult<Self> {
         let c = consts.c.clone();
         let mut s = State {
@@ -1428,6 +1453,8 @@ impl Rules {
             near_gap,
             wall_gap,
             vision_gap,
+            stair_gap,
+            stair: [None, None],
             front_tick: [None, None],
             cols: [None, None],
             moments_n: 0,
@@ -1519,6 +1546,7 @@ impl Rules {
                 s.cell_tick[cl as usize] = Some(t);
                 s.cut_tick[h] = Some(t);
                 s.col(h, cl);
+                s.set_stair(h, cl);
                 s.set_rest(h, d);
                 s.stack[h] += 1;
                 s.note_ticks.push(t);

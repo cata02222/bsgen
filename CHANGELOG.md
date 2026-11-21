@@ -1,5 +1,15 @@
 # Changelog
 
+**1.5.2** (2026-11-21)
+- parts of a song that come back get the same notes, like a mapper reusing a section
+- chains come in different lengths and shapes, like human maps
+- arcs on stacks start and end on the right notes
+- no more handclaps, staircases or notes hidden behind face notes
+- quiet songs get brought up to a normal level
+- songs that start right away get a short silence first, and no bombs or walls in the first 1.5 s
+- YouTube songs up to 90 minutes
+- replays: bombs count when the saber hits them, and the sabers no longer glitch when several difficulties play at once
+
 **1.5.1** (2026-11-15)
 - fewer crossed swings, so fewer awkward hand-overs in fast patterns
 - chain tails land on the beat grid, in a free spot
